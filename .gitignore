@@ -1,0 +1,9 @@
+.venv/
+venv/
+data/
+workdir/
+users.json
+.env
+__pycache__/
+*.pyc
+tests/_work/
