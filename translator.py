@@ -35,8 +35,10 @@ ENDPOINT = "https://translate.googleapis.com/translate_a/single"
 MAX_CHUNK_CHARS = 4000
 # Tamaño máximo de un lote (varios párrafos separados por \n).
 MAX_BATCH_CHARS = 3600
-MAX_ATTEMPTS = 5
-MAX_COOLDOWN = 90.0
+MAX_ATTEMPTS = 8
+MAX_COOLDOWN = 300.0
+# Separación mínima (s) entre peticiones, global para todas las tareas.
+MIN_REQUEST_INTERVAL = 0.4
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -140,6 +142,7 @@ class BaseTranslator:
         # Freno global: si Google limita, todas las tareas esperan.
         self._cooldown_until = 0.0
         self._fail_streak = 0
+        self._next_slot = 0.0
 
     # ------------------------------------------------------------------ ciclo de vida
 
@@ -285,9 +288,20 @@ class BaseTranslator:
                 return
             await asyncio.sleep(min(remaining, 5.0))
 
+    async def _pace(self) -> None:
+        """Separa las peticiones al menos MIN_REQUEST_INTERVAL entre sí."""
+        now = time.monotonic()
+        slot = max(now, self._next_slot)
+        self._next_slot = slot + MIN_REQUEST_INTERVAL
+        if slot > now:
+            await asyncio.sleep(slot - now)
+
     def _register_failure(self, err: Exception) -> None:
-        self._fail_streak += 1
-        delay = min(2.0 ** min(self._fail_streak + 1, 7), MAX_COOLDOWN)
+        # Solo el primer fallo de cada "oleada" sube el contador; los fallos
+        # simultáneos de otras tareas no lo inflan.
+        if time.monotonic() >= self._cooldown_until:
+            self._fail_streak += 1
+        delay = min(2.0 ** min(self._fail_streak + 1, 9), MAX_COOLDOWN)
         delay *= (0.75 + random.random() * 0.5) * self.retry_delay_scale
         self._cooldown_until = max(self._cooldown_until, time.monotonic() + delay)
         logger.warning(
@@ -306,6 +320,7 @@ class BaseTranslator:
             await self._wait_cooldown()
             try:
                 async with self._sem:
+                    await self._pace()
                     response = await self._send(self._client, text)
                 self.requests_done += 1
                 self.chars_sent += len(text)
