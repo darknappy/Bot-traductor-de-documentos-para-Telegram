@@ -168,9 +168,11 @@ También puedes escribirle un texto normal y te lo traduce al momento.
 - **Velocidad**: con el endpoint web gratuito una novela de 1500 capítulos
   (unas 4.000–8.000 peticiones agrupadas) tarda aproximadamente **entre 20
   minutos y 2 horas**, según el tamaño y las pausas por límite de Google.
-- **Si Google bloquea el ritmo**: el bot se frena solo, espera y reintenta; no
-  necesita que hagas nada. Puedes bajar `TRANSLATE_CONCURRENCY` (por ejemplo a
-  3) si ves muchas pausas.
+- **Si Google bloquea el ritmo (`HTTP 429`)**: no tienes que hacer nada; el bot
+  espacia las peticiones, cambia de endpoint, respeta la espera que pida Google
+  y reintenta solo. Desde un servidor (Render, VPS…) los límites son **más
+  estrictos** que desde casa, así que si ves el aviso a menudo sube
+  `WEB_MIN_INTERVAL` a `1`-`1.5` y baja `TRANSLATE_CONCURRENCY` a `2`-`3`.
 - **Volumen profesional**: si traduces muchas novelas al mes, activa el backend
   oficial (ver más abajo). Google Cloud Translation cuesta del orden de
   **20 $ por millón de caracteres** (los primeros 500.000 son gratis), así que
@@ -199,11 +201,14 @@ petición y sin límites agresivos.
   saltos de línea y se traducen en un solo envío. Si Google devuelve un número
   distinto de líneas, se reintenta ese lote párrafo a párrafo: nunca se pierde
   texto.
-- **Freno automático**: si Google responde `429` o corta la conexión, todas las
-  tareas pausan unos segundos (con reintentos exponenciales) y luego continúan.
-- **Motor gratuito**: endpoint público que usa el propio traductor de Google en
-  el navegador (`translate.googleapis.com/translate_a/single`). No necesita API
-  key ni cuenta.
+- **Freno y ritmo adaptativos**: las peticiones se espacian (por defecto 0,6 s
+  entre cada una). Si Google responde `429` o corta la conexión, el bot baja el
+  ritmo, espera (incluida la cabecera `Retry-After`), rota al siguiente endpoint
+  equivalente y reintenta con espera exponencial hasta 8 veces.
+- **Motor gratuito**: endpoints públicos que usa el propio traductor de Google
+  en el navegador (`client=gtx` sobre `translate.googleapis.com`, `clients5` y
+  `translate.google.com`; el último recurso usa `client=dict-chrome-ex`). No
+  necesita API key ni cuenta.
 - **PDF** (PyMuPDF): se extrae cada bloque de texto con su posición, tamaño,
   color y estilo; se traduce el bloque completo; se borra el texto original
   solo dentro de esa caja (respetando imágenes y gráficos) y se escribe la
@@ -245,6 +250,8 @@ data/               # (se crea sola) trabajo, progreso y caché
 | `TRANSLATOR_BACKEND` | `web` | `web` (gratis) o `api` (Google Cloud oficial) |
 | `GOOGLE_API_KEY` | — | Clave de la API oficial (solo con `api`) |
 | `TRANSLATE_CONCURRENCY` | `6` | Peticiones simultáneas al traductor |
+| `WEB_MIN_INTERVAL` | `0.6` | Segundos mínimos entre peticiones web (desde Render usa `1`-`1.5`) |
+| `WEB_MAX_INTERVAL` | `8` | Ritmo más lento al que se frena si Google limita (`429`) |
 | `MAX_CONCURRENT_JOBS` | `1` | Documentos traducidos a la vez |
 | `MAX_INPUT_MB` | `20` | Tamaño máximo de entrada |
 | `MAX_OUTPUT_MB` | `48` | Tamaño máximo de salida |

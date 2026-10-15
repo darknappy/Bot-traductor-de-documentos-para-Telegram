@@ -1,13 +1,19 @@
 """Traducción con Google Translate (endpoint web gratuito y API oficial).
 
-**Backend web** (por defecto, gratis y sin API key): usa la misma llamada que
-hace el traductor de Google en el navegador (``client=gtx`` sobre
-translate.googleapis.com). El servicio es público, pero limita la velocidad si
-se abusa de él, por eso:
+**Backend web** (por defecto, gratis y sin API key): usa las mismas llamadas que
+hace el traductor de Google en el navegador. El servicio es público, pero limita
+la velocidad si se abusa de él (sobre todo desde IP de datacenter, como la de
+Render), por eso:
 
-* las peticiones pasan por un semáforo (concurrencia configurable);
+* las peticiones pasan por un semáforo (concurrencia configurable) y por un
+  **ritmo adaptativo**: mínimo ``WEB_MIN_INTERVAL`` segundos entre peticiones;
+  si Google responde 429 el ritmo se reduce (hasta ``WEB_MAX_INTERVAL``) y se
+  recupera poco a poco cuando todo vuelve a ir bien;
+* hay varios **endpoints equivalentes** (translate.googleapis.com, clients5,
+  translate.google.com): si uno limita, se rota al siguiente;
 * cada fallo extiende un "tiempo de espera global" que todas las tareas
-  respetan (freno automático) y se reintenta con espera exponencial;
+  respetan (freno automático) y se reintenta con espera exponencial; si Google
+  manda la cabecera ``Retry-After`` se respeta;
 * los textos cortos se agrupan en **lotes** separados por saltos de línea para
   reducir el número de peticiones (clave con novelas de +1000 capítulos).
 
@@ -28,7 +34,21 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-ENDPOINT = "https://translate.googleapis.com/translate_a/single"
+# Endpoints públicos equivalentes del traductor web. Si uno empieza a limitar
+# (HTTP 429) se rota al siguiente. El formato de respuesta cambia entre los
+# endpoints "single" (client=gtx) y "legacy" (client=dict-chrome-ex, via GET).
+WEB_ENDPOINTS: tuple[tuple[str, str], ...] = (
+    ("https://translate.googleapis.com/translate_a/single", "single"),
+    ("https://clients5.google.com/translate_a/single", "single"),
+    ("https://translate.google.com/translate_a/single", "single"),
+    ("https://clients5.google.com/translate_a/t", "legacy"),
+    ("https://translate.google.com/translate_a/t", "legacy"),
+)
+# Nombre clásico del primer endpoint (por compatibilidad).
+ENDPOINT = WEB_ENDPOINTS[0][0]
+
+# Los endpoints "legacy" viajan por GET (el texto va en la URL, ~3 KB máximo).
+LEGACY_MAX_CHARS = 2500
 
 # El endpoint web admite bastantes caracteres, pero se es conservador para
 # reducir errores y truncamientos.
@@ -37,14 +57,33 @@ MAX_CHUNK_CHARS = 4000
 MAX_BATCH_CHARS = 3600
 MAX_ATTEMPTS = 8
 MAX_COOLDOWN = 300.0
-# Separación mínima (s) entre peticiones, global para todas las tareas.
-MIN_REQUEST_INTERVAL = 0.4
+RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+# Ritmo por defecto del endpoint web: segundos mínimos entre peticiones y tope
+# cuando Google empieza a limitar. Desde IP de datacenter (Render, VPS...) los
+# bursts de peticiones se castigan mucho antes, así que se empieza despacio.
+DEFAULT_MIN_INTERVAL = 0.6
+DEFAULT_MAX_INTERVAL = 8.0
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?…。！？;:])\s+")
+
+
+def _retry_after_seconds(response: httpx.Response | None) -> float:
+    """Segundos que Google pide esperar (cabecera Retry-After), si la envía."""
+    if response is None:
+        return 0.0
+    value = (response.headers.get("retry-after") or "").strip()
+    if not value:
+        return 0.0
+    try:
+        return min(max(float(value), 0.0), 300.0)
+    except ValueError:
+        return 0.0  # las fechas HTTP se ignoran
 
 
 class TranslationError(RuntimeError):
@@ -125,6 +164,8 @@ class BaseTranslator:
         max_batch_chars: int = MAX_BATCH_CHARS,
         transport: httpx.AsyncBaseTransport | None = None,
         retry_delay_scale: float = 1.0,
+        min_interval: float = 0.0,
+        max_interval: float = 0.0,
     ) -> None:
         self.target_lang = target_lang
         self.source_lang = source_lang
@@ -133,6 +174,8 @@ class BaseTranslator:
         self.max_chunk_chars = max_chunk_chars
         self.max_batch_chars = max_batch_chars
         self.retry_delay_scale = max(0.0, float(retry_delay_scale))
+        self.min_interval = max(0.0, float(min_interval))
+        self.max_interval = max(self.min_interval, float(max_interval))
         self.detected_lang: str | None = None
         self.requests_done = 0
         self.chars_sent = 0
@@ -142,12 +185,16 @@ class BaseTranslator:
         # Freno global: si Google limita, todas las tareas esperan.
         self._cooldown_until = 0.0
         self._fail_streak = 0
-        self._next_slot = 0.0
+        # Ritmo adaptativo (0 = sin espaciado; solo lo usa el backend web).
+        self._interval = self.min_interval
+        self._pace_next = 0.0
+        self._pace_lock: asyncio.Lock | None = None
 
     # ------------------------------------------------------------------ ciclo de vida
 
     async def __aenter__(self) -> "BaseTranslator":
         self._sem = asyncio.Semaphore(self.concurrency)
+        self._pace_lock = asyncio.Lock()
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(self.timeout),
             headers={
@@ -165,6 +212,7 @@ class BaseTranslator:
             await self._client.aclose()
             self._client = None
         self._sem = None
+        self._pace_lock = None
 
     # ------------------------------------------------------------------ API pública
 
@@ -289,16 +337,49 @@ class BaseTranslator:
             await asyncio.sleep(min(remaining, 5.0))
 
     async def _pace(self) -> None:
-        """Separa las peticiones al menos MIN_REQUEST_INTERVAL entre sí."""
-        now = time.monotonic()
-        slot = max(now, self._next_slot)
-        self._next_slot = slot + MIN_REQUEST_INTERVAL
-        if slot > now:
-            await asyncio.sleep(slot - now)
+        """Espacia el inicio de las peticiones para no disparar el límite."""
+        lock = self._pace_lock
+        if lock is None or self._interval <= 0:
+            return
+        async with lock:
+            now = time.monotonic()
+            wait = self._pace_next - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+                now = time.monotonic()
+            self._pace_next = now + self._interval
+
+    def _slow_down(self) -> None:
+        """Baja el ritmo cuando Google empieza a limitar."""
+        if self.max_interval <= 0:
+            return
+        new_interval = min(self.max_interval, max(self._interval * 2.0, 1.0))
+        if new_interval > self._interval + 0.001:
+            self._interval = new_interval
+            logger.warning(
+                "Google está limitando: se espacian las peticiones a %.1f s", new_interval
+            )
+
+    def _speed_up(self) -> None:
+        """Recupera el ritmo poco a poco mientras las peticiones van bien."""
+        if self.max_interval > 0 and self._interval > self.min_interval:
+            self._interval = max(self.min_interval, self._interval * 0.98)
+
+    def _on_retryable(self, response: httpx.Response | None, err: Exception) -> None:
+        """Gancho al fallar una petición reintentable (los 429 bajan el ritmo)."""
+        if response is not None and response.status_code == 429:
+            self._slow_down()
+            wait = _retry_after_seconds(response)
+            if wait > 0:
+                self._cooldown_until = max(self._cooldown_until, time.monotonic() + wait)
+                logger.info("Google pidió esperar %.0f s antes de reintentar", wait)
+        elif response is None and isinstance(err, httpx.HTTPError):
+            # Corte de red: mejor no insistir al mismo ritmo.
+            self._slow_down()
 
     def _register_failure(self, err: Exception) -> None:
-        # Solo el primer fallo de cada "oleada" sube el contador; los fallos
-        # simultáneos de otras tareas no lo inflan.
+        # Solo el primer fallo de cada "oleada" sube el contador: los fallos
+        # simultáneos de otras tareas no lo inflan sin motivo.
         if time.monotonic() >= self._cooldown_until:
             self._fail_streak += 1
         delay = min(2.0 ** min(self._fail_streak + 1, 9), MAX_COOLDOWN)
@@ -318,21 +399,26 @@ class BaseTranslator:
         last_err: Exception | None = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
             await self._wait_cooldown()
+            await self._pace()
+            response: httpx.Response | None = None
             try:
                 async with self._sem:
-                    await self._pace()
-                    response = await self._send(self._client, text)
+                    response, kind = await self._send(self._client, text)
                 self.requests_done += 1
                 self.chars_sent += len(text)
-                if response.status_code in (429, 500, 502, 503, 504):
+                if response.status_code in RETRY_STATUSES:
                     raise TranslationError(f"HTTP {response.status_code}")
                 response.raise_for_status()
-                result = self._parse(response)
+                result = self._parse(response, kind)
                 self._fail_streak = 0
+                self._speed_up()
                 return result
             except (httpx.HTTPError, TranslationError) as err:
                 last_err = err
+                # Primero el freno global (decide según la oleada de fallos) y
+                # después se ajusta el ritmo con lo que haya pedido Google.
                 self._register_failure(err)
+                self._on_retryable(response, err)
                 if attempt < MAX_ATTEMPTS:
                     delay = (min(2.0 ** attempt, 20.0) + random.uniform(0.0, 1.0)) * self.retry_delay_scale
                     logger.info("Reintento %d/%d de traducción en %.1f s", attempt, MAX_ATTEMPTS, delay)
@@ -340,19 +426,69 @@ class BaseTranslator:
                         await asyncio.sleep(delay)
         raise TranslationError(f"No se pudo traducir tras {MAX_ATTEMPTS} intentos: {last_err}")
 
-    async def _send(self, client: httpx.AsyncClient, text: str) -> httpx.Response:  # pragma: no cover
+    async def _send(self, client: httpx.AsyncClient, text: str) -> tuple[httpx.Response, str]:  # pragma: no cover
+        """Envía una petición y devuelve la respuesta junto al formato usado."""
         raise NotImplementedError
 
-    def _parse(self, response: httpx.Response) -> tuple[str, str | None]:  # pragma: no cover
+    def _parse(self, response: httpx.Response, kind: str) -> tuple[str, str | None]:  # pragma: no cover
+        """Extrae ``(texto traducido, idioma detectado)`` de la respuesta."""
         raise NotImplementedError
 
 
 class GoogleWebTranslator(BaseTranslator):
-    """Cliente del traductor web de Google (gratis, sin API key)."""
+    """Cliente del traductor web de Google (gratis, sin API key).
+
+    Rota entre varios endpoints públicos equivalentes cuando uno empieza a
+    limitar las peticiones, y espacia las peticiones de forma adaptativa.
+    """
 
     name = "google-web"
 
-    async def _send(self, client: httpx.AsyncClient, text: str) -> httpx.Response:
+    def __init__(self, target_lang: str, **kwargs) -> None:
+        kwargs.setdefault("min_interval", DEFAULT_MIN_INTERVAL)
+        kwargs.setdefault("max_interval", DEFAULT_MAX_INTERVAL)
+        super().__init__(target_lang, **kwargs)
+        self._endpoint_index = 0
+
+    # ------------------------------------------------------------------ endpoints
+
+    def _pick_endpoint(self, text: str) -> tuple[str, str]:
+        """Elige el endpoint actual, saltando los GET si el texto es demasiado largo."""
+        length = len(text)
+        for offset in range(len(WEB_ENDPOINTS)):
+            index = (self._endpoint_index + offset) % len(WEB_ENDPOINTS)
+            url, kind = WEB_ENDPOINTS[index]
+            if kind == "legacy" and length > LEGACY_MAX_CHARS:
+                continue  # el texto viaja en la URL: no admite lotes grandes
+            return url, kind
+        return WEB_ENDPOINTS[0]
+
+    def _rotate_endpoint(self, status: int | None) -> None:
+        self._endpoint_index = (self._endpoint_index + 1) % len(WEB_ENDPOINTS)
+        logger.info(
+            "Cambiando de endpoint de Google (%s) → %s",
+            f"HTTP {status}" if status else "error de red",
+            WEB_ENDPOINTS[self._endpoint_index][0],
+        )
+
+    def _on_retryable(self, response: httpx.Response | None, err: Exception) -> None:
+        super()._on_retryable(response, err)
+        status = response.status_code if response is not None else None
+        if status in RETRY_STATUSES or isinstance(err, httpx.HTTPError):
+            self._rotate_endpoint(status)
+
+    # ------------------------------------------------------------------ peticiones
+
+    async def _send(self, client: httpx.AsyncClient, text: str) -> tuple[httpx.Response, str]:
+        url, kind = self._pick_endpoint(text)
+        if kind == "legacy":
+            params = {
+                "client": "dict-chrome-ex",
+                "sl": self.source_lang,
+                "tl": self.target_lang,
+                "q": text,
+            }
+            return await client.get(url, params=params), kind
         payload = {
             "client": "gtx",
             "sl": self.source_lang,
@@ -362,9 +498,9 @@ class GoogleWebTranslator(BaseTranslator):
             "oe": "UTF-8",
             "q": text,
         }
-        return await client.post(ENDPOINT, data=payload)
+        return await client.post(url, data=payload), kind
 
-    def _parse(self, response: httpx.Response) -> tuple[str, str | None]:
+    def _parse(self, response: httpx.Response, kind: str) -> tuple[str, str | None]:
         content_type = response.headers.get("content-type", "")
         if "json" not in content_type.lower():
             raise TranslationError("respuesta no JSON (posible bloqueo temporal de Google)")
@@ -372,7 +508,16 @@ class GoogleWebTranslator(BaseTranslator):
             data = response.json()
         except json.JSONDecodeError as err:
             raise TranslationError("JSON inválido del traductor") from err
-        if not isinstance(data, list) or not data or not isinstance(data[0], list):
+        if not isinstance(data, list) or not data:
+            raise TranslationError("respuesta inesperada del traductor")
+        if kind == "legacy":
+            # Formato compacto: [["texto traducido", "idioma original"]]
+            first = data[0]
+            if isinstance(first, list) and first and isinstance(first[0], str):
+                detected = first[1] if len(first) > 1 and isinstance(first[1], str) else None
+                return first[0], detected
+            raise TranslationError("respuesta inesperada del traductor")
+        if not isinstance(data[0], list):
             raise TranslationError("respuesta inesperada del traductor")
         translated = "".join(
             segment[0]
@@ -397,6 +542,16 @@ def create_translator(target_lang: str, *, concurrency: int | None = None) -> Ba
                 "TRANSLATOR_BACKEND=%s pero falta GOOGLE_API_KEY; se usa el endpoint web",
                 backend,
             )
-            return GoogleWebTranslator(target_lang, concurrency=workers)
+            return GoogleWebTranslator(
+                target_lang,
+                concurrency=workers,
+                min_interval=config.WEB_MIN_INTERVAL,
+                max_interval=config.WEB_MAX_INTERVAL,
+            )
         return GoogleApiTranslator(target_lang, api_key=config.GOOGLE_API_KEY, concurrency=workers)
-    return GoogleWebTranslator(target_lang, concurrency=workers)
+    return GoogleWebTranslator(
+        target_lang,
+        concurrency=workers,
+        min_interval=config.WEB_MIN_INTERVAL,
+        max_interval=config.WEB_MAX_INTERVAL,
+    )

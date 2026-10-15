@@ -38,7 +38,12 @@ services:
       - key: DEFAULT_TARGET_LANG
         value: es
       - key: TRANSLATE_CONCURRENCY
-        value: "6"
+        value: "3"
+      # Ritmo del endpoint web gratuito (los IP de datacenter se limitan antes).
+      - key: WEB_MIN_INTERVAL
+        value: "1.0"
+      - key: WEB_MAX_INTERVAL
+        value: "10"
       - key: MAX_CONCURRENT_JOBS
         value: "1"
       - key: TRANSLATOR_BACKEND

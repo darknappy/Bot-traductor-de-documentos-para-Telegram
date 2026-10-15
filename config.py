@@ -48,6 +48,11 @@ GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "").strip()
 # Peticiones simultáneas al traductor.
 TRANSLATE_CONCURRENCY: int = max(1, _env_int("TRANSLATE_CONCURRENCY", 6))
 
+# Ritmo del endpoint web gratuito: segundos mínimos entre peticiones y tope
+# cuando Google limita (HTTP 429). Desde IP de datacenter conviene ir despacio.
+WEB_MIN_INTERVAL: float = max(0.0, _env_float("WEB_MIN_INTERVAL", 0.6))
+WEB_MAX_INTERVAL: float = max(WEB_MIN_INTERVAL, _env_float("WEB_MAX_INTERVAL", 8.0))
+
 # Documentos procesados a la vez (cada uno usa su propia concurrencia).
 MAX_CONCURRENT_JOBS: int = max(1, _env_int("MAX_CONCURRENT_JOBS", 1))
 

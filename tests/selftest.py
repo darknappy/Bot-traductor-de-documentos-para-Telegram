@@ -577,6 +577,83 @@ async def test_web_fallback_and_cooldown() -> None:
     print("OK · mezcla de líneas y freno por bloqueo temporal")
 
 
+def _multi_host_handler(calls: list[str], blocked: frozenset = frozenset(), fail_first: int = 0):
+    """Simula los endpoints de Google: bloquea hosts o los primeros intentos."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if len(calls) <= fail_first or request.url.host in blocked:
+            return httpx.Response(
+                429, text="too many requests", headers={"retry-after": "0.2", "content-type": "text/plain"}
+            )
+        if request.url.path.endswith("/translate_a/t"):  # formato "legacy"
+            text = request.url.params.get("q", "")
+            translated = "\n".join(
+                f"[ES] {line.upper()}" for line in text.split("\n") if line.strip()
+            )
+            return httpx.Response(
+                200,
+                json=[[translated, "en"]],
+                headers={"content-type": "application/json"},
+            )
+        text = parse_qs(request.content.decode("utf-8")).get("q", [""])[0]
+        lines = [line for line in text.split("\n") if line.strip()]
+        segments = [
+            [f"[ES] {line.upper()}" + ("\n" if index < len(lines) - 1 else ""), line, None, None, 10]
+            for index, line in enumerate(lines)
+        ]
+        return httpx.Response(
+            200, json=[segments, None, "en"], headers={"content-type": "application/json"}
+        )
+
+    return handler
+
+
+async def test_web_endpoint_failover() -> None:
+    """Si un endpoint limita (429), se rota a otro host equivalente."""
+    calls: list[str] = []
+    transport = httpx.MockTransport(_multi_host_handler(calls, blocked=frozenset({"translate.googleapis.com"})))
+    async with GoogleWebTranslator(
+        "es", concurrency=2, transport=transport, min_interval=0.0, max_interval=0.0
+    ) as translator:
+        translator.retry_delay_scale = 0.0
+        results = await translator.translate_many(["First paragraph.", "Second paragraph."])
+    assert results == ["[ES] FIRST PARAGRAPH.", "[ES] SECOND PARAGRAPH."], results
+    assert calls[0].startswith("https://translate.googleapis.com/"), calls
+    assert any("clients5.google.com" in url for url in calls), calls
+    assert translator._endpoint_index == 1, translator._endpoint_index
+
+    # El formato "legacy" (GET + dict-chrome-ex) también se interpreta bien
+    calls.clear()
+    transport = httpx.MockTransport(_multi_host_handler(calls))
+    async with GoogleWebTranslator(
+        "es", concurrency=1, transport=transport, min_interval=0.0, max_interval=0.0
+    ) as translator:
+        translator._endpoint_index = 3
+        results = await translator.translate_many(["Hello my friend", "Good night"])
+    assert all("/translate_a/t" in url and "dict-chrome-ex" in url for url in calls), calls
+    assert results == ["[ES] HELLO MY FRIEND", "[ES] GOOD NIGHT"], results
+    assert translator.detected_lang == "en", translator.detected_lang
+    print("OK · rotación de endpoints y formato legacy")
+
+
+async def test_web_rhythm() -> None:
+    """Los 429 bajan el ritmo (hasta el tope) y se respeta Retry-After."""
+    calls: list[str] = []
+    transport = httpx.MockTransport(_multi_host_handler(calls, fail_first=3))
+    started = time.monotonic()
+    async with GoogleWebTranslator(
+        "es", concurrency=1, transport=transport, min_interval=0.05, max_interval=0.5
+    ) as translator:
+        translator.retry_delay_scale = 0.0
+        result = await translator.translate("Some text here.")
+    elapsed = time.monotonic() - started
+    assert result == "[ES] SOME TEXT HERE.", result
+    assert translator._interval > 0.4, translator._interval  # se frenó hasta el tope
+    assert elapsed >= 0.15, elapsed  # esperó lo que pidió Google (Retry-After)
+    print(f"OK · ritmo adaptativo (frenó a {translator._interval:.2f} s y respetó Retry-After)")
+
+
 async def test_api_translator() -> None:
     """El backend de la API oficial envía varios segmentos por petición."""
     requests: list[dict] = []
@@ -880,6 +957,8 @@ async def main() -> None:
         await test_job_store()
         await test_web_batches()
         await test_web_fallback_and_cooldown()
+        await test_web_endpoint_failover()
+        await test_web_rhythm()
         await test_api_translator()
         await test_pdf_mock()
         await test_scanned_pdf()

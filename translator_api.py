@@ -39,9 +39,9 @@ class GoogleApiTranslator(BaseTranslator):
 
     # ------------------------------------------------------------------ peticiones
 
-    async def _send(self, client: httpx.AsyncClient, text: str) -> httpx.Response:  # pragma: no cover
+    async def _send(self, client: httpx.AsyncClient, text: str) -> tuple[httpx.Response, str]:  # pragma: no cover
         # No se usa: la API envía varios segmentos por petición (_request_batch).
-        return await self._post(client, [text])
+        return await self._post(client, [text]), "api"
 
     async def _post(self, client: httpx.AsyncClient, texts: list[str]) -> httpx.Response:
         body: dict = {"q": texts, "target": self.target_lang, "format": "text"}
@@ -49,7 +49,7 @@ class GoogleApiTranslator(BaseTranslator):
             body["source"] = self.source_lang
         return await client.post(API_ENDPOINT, params={"key": self.api_key}, json=body)
 
-    def _parse(self, response: httpx.Response) -> tuple[str, str | None]:  # pragma: no cover
+    def _parse(self, response: httpx.Response, _kind: str = "api") -> tuple[str, str | None]:  # pragma: no cover
         # No se usa directamente; ver _request_batch.
         values, detected = _parse_api_response(response)
         return values[0], detected
@@ -63,6 +63,7 @@ class GoogleApiTranslator(BaseTranslator):
         last_err: Exception | None = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
             await self._wait_cooldown()
+            response: httpx.Response | None = None
             try:
                 async with self._sem:
                     response = await self._post(self._client, texts)
@@ -78,6 +79,7 @@ class GoogleApiTranslator(BaseTranslator):
                 return values, detected
             except (httpx.HTTPError, TranslationError) as err:
                 last_err = err
+                self._on_retryable(response, err)
                 self._register_failure(err)
                 if attempt < MAX_ATTEMPTS:
                     delay = min(2.0 ** attempt, 20.0) * self.retry_delay_scale
