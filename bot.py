@@ -1,5 +1,8 @@
 """Bot de Telegram que traduce documentos (PDF, EPUB, TXT, MD) con Google y Microsoft.
 
+Incluye un divisor de novelas (/dividir) para trabajar por secciones en libros
+enormes.
+
 Uso:
     1. Copia .env.example a .env y pega el token de @BotFather.
     2. python bot.py
@@ -31,9 +34,17 @@ from telegram.request import HTTPXRequest
 import config
 import languages
 import users
-from errors import JobCancelledError, ScannedPdfError, UnsupportedFormatError
+from errors import JobCancelledError, ScannedPdfError, SplitError, UnsupportedFormatError
 from health import start_health_server
-from pipeline import DocumentTask, format_duration, get_store, process_job, safe_filename
+from pipeline import (
+    DocumentTask,
+    format_duration,
+    get_store,
+    process_job,
+    process_split_job,
+    safe_filename,
+)
+from splitter import describe_spec, parse_split_command
 from translator import TranslationError, create_translator
 
 logging.basicConfig(
@@ -107,14 +118,16 @@ def help_text(lang: str) -> str:
         f"Idioma de destino actual: <b>{html.escape(languages.language_name(lang))}</b>\n\n"
         "Comandos:\n"
         "/lang – cambiar el idioma de destino\n"
+        "/dividir – partir una novela larga en secciones\n"
         "/status – estado del bot y tareas en curso\n"
         "/cancel – cancelar la tarea en curso\n"
         "/help – mostrar esta ayuda\n\n"
         f"⚠️ Los bots de Telegram solo pueden descargar archivos de hasta "
         f"{config.MAX_INPUT_MB} MB.\n"
-        "📚 <b>Novelas largas</b>: las traducciones de muchas horas se guardan por "
-        "capítulos. Si el bot se reinicia, reenvía el mismo archivo y continuará donde "
-        "iba; si ya estaba terminado, te lo devuelve al instante."
+        "📚 <b>Novelas largas</b>: usa /dividir para trocear el libro en secciones "
+        "(~50 capítulos) y traduce cada una por separado. Así, si una falla o el bot "
+        "se reinicia, solo reenvías esa sección. Si traduces el libro entero, el bot "
+        "guarda el progreso capítulo a capítulo y lo reanuda donde iba."
     )
 
 
@@ -143,13 +156,13 @@ def _progress_text(task: DocumentTask, fraction: float, note: str, elapsed: floa
     fraction = min(1.0, max(0.0, fraction))
     filled = int(round(fraction * 10))
     bar = "▓" * filled + "░" * (10 - filled)
-    return (
-        "🔄 <b>Traduciendo…</b>\n"
-        f"📄 {html.escape(task.file_name)}\n"
-        f"🌐 → {html.escape(languages.language_name(task.lang))}\n"
-        f"{bar} {int(round(fraction * 100))}% · {html.escape(note)}\n"
-        f"⏱️ {format_duration(elapsed)}"
-    )
+    header = "✂️ <b>Dividiendo…</b>" if task.mode == "split" else "🔄 <b>Traduciendo…</b>"
+    lines = [header, f"📄 {html.escape(task.file_name)}"]
+    if task.mode != "split":
+        lines.append(f"🌐 → {html.escape(languages.language_name(task.lang))}")
+    lines.append(f"{bar} {int(round(fraction * 100))}% · {html.escape(note)}")
+    lines.append(f"⏱️ {format_duration(elapsed)}")
+    return "\n".join(lines)
 
 
 class ProgressReporter:
@@ -281,6 +294,25 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(status_text(), parse_mode=ParseMode.HTML)
 
 
+async def cmd_dividir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/dividir: el próximo documento se parte en secciones sin traducir."""
+    args = context.args or []
+    spec = parse_split_command("/dividir " + " ".join(args))
+    context.user_data["split_mode"] = spec
+    await update.message.reply_text(
+        "✂️ <b>Divisor de novelas</b>\n"
+        f"El próximo archivo que envíes se partirá <b>sin traducir</b> "
+        f"({html.escape(describe_spec(spec))}).\n\n"
+        "• <code>/dividir</code> → tamaño automático\n"
+        "• <code>/dividir 25</code> → 25 capítulos por sección (en PDF, páginas)\n"
+        "• <code>/dividir 8 partes</code> → 8 secciones\n\n"
+        "También puedes enviar el archivo con la leyenda «<code>/dividir 25</code>» "
+        "en el pie de foto. Después traduce cada sección por separado: si una falla, "
+        "solo tendrás que reenviar esa.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 # --------------------------------------------------------------------------- documentos
 
 
@@ -312,6 +344,13 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     active: dict = app.bot_data[_ACTIVE_KEY]
     pending: dict = app.bot_data[_PENDING_KEY]
 
+    # Modo división: con la leyenda «/dividir …» o activado antes con /dividir.
+    spec = parse_split_command(message.caption or "")
+    if spec is None:
+        spec = context.user_data.pop("split_mode", None)
+    else:
+        context.user_data.pop("split_mode", None)
+
     lang = users.get_lang(user.id)
     task_id = uuid.uuid4().hex[:12]
     workdir = config.WORK_DIR / task_id
@@ -326,6 +365,8 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         src_path=dest,
         file_name=file_name,
         lang=lang,
+        mode="split" if spec else "translate",
+        split_spec=spec,
     )
 
     # Reserva al usuario antes de descargar: evita procesar dos archivos a la vez
@@ -364,9 +405,13 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     queue: asyncio.Queue = app.bot_data[_QUEUE_KEY]
     queue.put_nowait(task)
 
+    if spec:
+        detail = "✂️ Modo división: se partirá en secciones sin traducir.\n"
+    else:
+        detail = f"🌐 → {html.escape(languages.language_name(lang))}\n"
     await status.edit_text(
         f"📥 Recibido «{html.escape(file_name)}» ({size / 1048576:.1f} MB)\n"
-        f"🌐 → {html.escape(languages.language_name(lang))}\n"
+        f"{detail}"
         f"🕒 En cola… hay {queue.qsize()} tarea(s) por delante.",
         parse_mode=ParseMode.HTML,
     )
@@ -417,18 +462,18 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # --------------------------------------------------------------------------- cola de trabajo
 
 
-async def _send_result(bot, task: DocumentTask, result) -> None:
-    """Envía el archivo traducido con reintentos (los libros tardan horas)."""
+async def _send_file(bot, task: DocumentTask, path: Path, name: str, caption: str) -> None:
+    """Envía un archivo por Telegram con reintentos (los libros tardan horas)."""
     last_err: Exception | None = None
     for attempt in range(1, 4):
         try:
             await bot.send_chat_action(chat_id=task.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-            with open(result.out_path, "rb") as handle:
+            with open(path, "rb") as handle:
                 await bot.send_document(
                     chat_id=task.chat_id,
                     document=handle,
-                    filename=result.out_name,
-                    caption=result.caption,
+                    filename=name,
+                    caption=caption,
                     parse_mode=ParseMode.HTML,
                     reply_to_message_id=task.src_message_id,
                     read_timeout=600,
@@ -475,32 +520,54 @@ async def _worker(app: Application) -> None:
                     _progress_text(task, fraction, note, time.monotonic() - task.started_at)
                 )
 
-            result = await process_job(task, report)
+            if task.mode == "split":
+                outcome = await process_split_job(task, report)
+                await reporter.update(f"📤 Enviando {len(outcome.parts)} sección(es)…", force=True)
+                for part in outcome.parts:
+                    await _send_file(bot, task, part.out_path, part.out_name, part.caption)
+                    await asyncio.sleep(0.4)  # ritmo suave para los límites de Telegram
+                await reporter.update(outcome.summary, force=True)
+            else:
+                result = await process_job(task, report)
 
-            out_mb = result.out_path.stat().st_size / 1048576
-            if out_mb > config.MAX_OUTPUT_MB:
-                await _safe_edit(
-                    bot,
-                    task,
-                    f"❌ El resultado pesa {out_mb:.1f} MB y Telegram no permite enviarlo "
-                    f"(máximo {config.MAX_OUTPUT_MB} MB). Prueba con un documento más pequeño.",
-                )
-                continue
+                out_mb = result.out_path.stat().st_size / 1048576
+                if out_mb > config.MAX_OUTPUT_MB:
+                    await _safe_edit(
+                        bot,
+                        task,
+                        f"❌ El resultado pesa {out_mb:.1f} MB y Telegram no permite enviarlo "
+                        f"(máximo {config.MAX_OUTPUT_MB} MB). Prueba con un documento más pequeño.",
+                    )
+                    continue
 
-            await reporter.update(f"📤 Enviando «{html.escape(result.out_name)}»…", force=True)
-            await _send_result(bot, task, result)
-            await reporter.update("✅ Listo.", force=True)
+                await reporter.update(f"📤 Enviando «{html.escape(result.out_name)}»…", force=True)
+                await _send_file(bot, task, result.out_path, result.out_name, result.caption)
+                await reporter.update("✅ Listo.", force=True)
         except JobCancelledError:
-            await _safe_edit(bot, task, "🚫 Traducción cancelada.")
-        except TelegramError as err:
-            logger.error("Fallo de Telegram al enviar %s: %s", task.task_id, err)
             await _safe_edit(
                 bot,
                 task,
-                "⚠️ La traducción terminó pero Telegram no aceptó el archivo. "
-                "Vuelve a enviarme el mismo documento y te lo mandaré al instante desde la caché.",
+                "🚫 División cancelada." if task.mode == "split" else "🚫 Traducción cancelada.",
             )
+        except TelegramError as err:
+            logger.error("Fallo de Telegram al enviar %s: %s", task.task_id, err)
+            if task.mode == "split":
+                await _safe_edit(
+                    bot,
+                    task,
+                    "⚠️ La división terminó pero Telegram no aceptó enviar todas las secciones. "
+                    "Vuelve a enviarme el archivo con /dividir y te las mandaré de nuevo.",
+                )
+            else:
+                await _safe_edit(
+                    bot,
+                    task,
+                    "⚠️ La traducción terminó pero Telegram no aceptó el archivo. "
+                    "Vuelve a enviarme el mismo documento y te lo mandaré al instante desde la caché.",
+                )
         except ScannedPdfError as err:
+            await _safe_edit(bot, task, f"❌ {html.escape(str(err))}")
+        except SplitError as err:
             await _safe_edit(bot, task, f"❌ {html.escape(str(err))}")
         except UnsupportedFormatError as err:
             await _safe_edit(bot, task, f"❌ {html.escape(str(err))}")
@@ -513,7 +580,7 @@ async def _worker(app: Application) -> None:
             )
         except Exception:  # noqa: BLE001
             logger.exception("Fallo procesando la tarea %s", task.task_id)
-            await _safe_edit(bot, task, "⚠️ Ocurrió un error inesperado al traducir el documento.")
+            await _safe_edit(bot, task, "⚠️ Ocurrió un error inesperado al procesar el documento.")
         finally:
             active.pop(task.user_id, None)
             pending.pop(task.user_id, None)
@@ -530,6 +597,7 @@ async def _post_init(app: Application) -> None:
         [
             BotCommand("start", "Cómo funciona"),
             BotCommand("lang", "Cambiar el idioma de destino"),
+            BotCommand("dividir", "Partir una novela larga en secciones"),
             BotCommand("status", "Estado del bot y tareas en curso"),
             BotCommand("cancel", "Cancelar la tarea en curso"),
             BotCommand("help", "Ayuda"),
@@ -598,6 +666,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("lang", cmd_lang))
+    app.add_handler(CommandHandler("dividir", cmd_dividir, filters=~filters.Document.ALL))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(on_lang_button, pattern=r"^lang:"))

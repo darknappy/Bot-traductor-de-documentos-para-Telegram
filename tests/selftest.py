@@ -6,8 +6,9 @@ Uso:
 
 Comprueba que la traducción de PDF y EPUB conserva estructura, estilos,
 imágenes y enlaces, que el texto original se reemplaza de verdad, que los lotes
-de traducción funcionan, que las peticiones bloqueadas se reintentan y que las
-traducciones largas se reanudan donde se quedaron.
+de traducción funcionan, que las peticiones bloqueadas se reintentan, que las
+traducciones largas se reanudan donde se quedaron y que el divisor de novelas
+detecta capítulos y genera secciones válidas y sin pérdidas.
 """
 from __future__ import annotations
 
@@ -39,10 +40,11 @@ import languages
 import pdf_translate
 from checkpoints import JobStore, file_digest
 from epub_translate import translate_epub
-from errors import JobCancelledError, ScannedPdfError, UnsupportedFormatError
+from errors import JobCancelledError, ScannedPdfError, SplitError, UnsupportedFormatError
 from health import start_health_server
 from pdf_translate import translate_pdf
 from pipeline import DocumentTask, format_duration, safe_filename
+from splitter import SplitSpec, parse_split_command, split_document
 from translator import (
     AutoTranslator,
     GoogleWebTranslator,
@@ -259,6 +261,105 @@ def make_sample_epub(path: Path, drm: bool = False) -> None:
         zout.writestr("OEBPS/ch2.xhtml", CH2)
         zout.writestr("OEBPS/style.css", STYLE)
         zout.writestr("OEBPS/cover.png", _png_bytes())
+
+
+CHAPTER_XHTML = """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="ko">
+<head><title>{title}</title><meta charset="utf-8"/>
+<link rel="stylesheet" type="text/css" href="style.css"/></head>
+<body><h1>{title}</h1><p>Texto original del capítulo {number}.</p>
+<p>Otro párrafo con <i>cursiva</i> y un enlace interno al capítulo 1.</p></body>
+</html>
+"""
+
+
+def make_chapter_epub(path: Path, chapters: int = 12) -> None:
+    """EPUB con muchos capítulos, uno por archivo (como las novelas web)."""
+    manifest = [
+        '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',
+        '<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>',
+    ]
+    spine = ['<itemref idref="nav"/>']
+    links = []
+    points = []
+    for number in range(1, chapters + 1):
+        manifest.append(
+            f'<item id="ch{number}" href="ch{number}.xhtml" media-type="application/xhtml+xml"/>'
+        )
+        spine.append(f'<itemref idref="ch{number}"/>')
+        links.append(f'    <li><a href="ch{number}.xhtml">Capítulo {number}</a></li>')
+        points.append(
+            f'    <navPoint id="np-{number}" playOrder="{number}">'
+            f"<navLabel><text>Capítulo {number}</text></navLabel>"
+            f'<content src="ch{number}.xhtml"/></navPoint>'
+        )
+    manifest += [
+        '<item id="css" href="style.css" media-type="text/css"/>',
+        '<item id="cover" href="cover.png" media-type="image/png"/>',
+    ]
+    opf = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">\n'
+        '  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n'
+        f'    <dc:identifier id="id">cap-{chapters}</dc:identifier>\n'
+        "    <dc:title>Novela de prueba</dc:title>\n"
+        "    <dc:language>ko</dc:language>\n"
+        "  </metadata>\n"
+        "  <manifest>\n    "
+        + "\n    ".join(manifest)
+        + "\n  </manifest>\n"
+        '  <spine toc="ncx">\n    '
+        + "\n    ".join(spine)
+        + "\n  </spine>\n"
+        "</package>\n"
+    )
+    ncx = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">\n'
+        f'<head><meta name="dtb:uid" content="cap-{chapters}"/></head>\n'
+        "<docTitle><text>Novela de prueba</text></docTitle>\n"
+        "<navMap>\n" + "\n".join(points) + "\n</navMap>\n</ncx>\n"
+    )
+    nav = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="ko">\n'
+        '<head><title>Índice</title><meta charset="utf-8"/></head>\n'
+        "<body>\n"
+        '<nav epub:type="toc" id="toc"><h1>Índice</h1>\n'
+        "<ol>\n" + "\n".join(links) + "\n</ol>\n"
+        "</nav>\n</body>\n</html>\n"
+    )
+    with zipfile.ZipFile(path, "w") as zout:
+        info = zipfile.ZipInfo("mimetype", date_time=(1980, 1, 1, 0, 0, 0))
+        zout.writestr(info, b"application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        zout.writestr("META-INF/container.xml", CONTAINER_XML)
+        zout.writestr("OEBPS/content.opf", opf)
+        zout.writestr("OEBPS/toc.ncx", ncx)
+        zout.writestr("OEBPS/nav.xhtml", nav)
+        for number in range(1, chapters + 1):
+            zout.writestr(
+                f"OEBPS/ch{number}.xhtml",
+                CHAPTER_XHTML.format(title=f"Capítulo {number}", number=number),
+            )
+        zout.writestr("OEBPS/style.css", STYLE)
+        zout.writestr("OEBPS/cover.png", _png_bytes())
+
+
+def make_novel_txt(path: Path, chapters: int = 12) -> str:
+    """TXT de novela con índice al principio y encabezados «Capítulo N»."""
+    lines = ["Novela de prueba", ""]
+    for number in range(1, chapters + 1):
+        lines.append(f"Capítulo {number}")  # índice (bloque seguido: debe ignorarse)
+    lines.append("")
+    for number in range(1, chapters + 1):
+        lines.append(f"Capítulo {number}: El comienzo")
+        lines.append("")
+        for paragraph in range(4):
+            lines.append(f"Texto del capítulo {number}, párrafo {paragraph}.")
+        lines.append("")
+    text = "\n".join(lines)
+    path.write_text(text, "utf-8")
+    return text
 
 
 # --------------------------------------------------------------------------- pruebas
@@ -491,6 +592,162 @@ async def test_txt_resume() -> None:
     assert translated.count("[ES]") == 100, translated.count("[ES]")
     assert "Line number 99" not in translated
     print("OK · reanudación de TXT:", stats)
+
+
+# --------------------------------------------------------------------------- divisor de novelas
+
+
+def test_split_command() -> None:
+    assert parse_split_command("/dividir") == SplitSpec("units", None)
+    assert parse_split_command("/dividir 25") == SplitSpec("units", 25)
+    assert parse_split_command("dividir 8 partes") == SplitSpec("parts", 8)
+    assert parse_split_command("/partir 60 secciones") == SplitSpec("parts", 60)
+    assert parse_split_command("/split") == SplitSpec("units", None)
+    assert parse_split_command("/traducir 25") is None
+    assert parse_split_command("Hola mundo") is None
+    assert parse_split_command("") is None
+    # el tamaño del pie de foto no importa: solo el primer número y «partes»
+    assert parse_split_command("/dividir 3 partes por favor") == SplitSpec("parts", 3)
+    print("OK · comandos de /dividir")
+
+
+def test_split_text() -> None:
+    src = WORK / "novela_split.txt"
+    out_dir = WORK / "split_txt"
+    shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    text = make_novel_txt(src, chapters=130)
+
+    report = split_document(src, "novela_split.txt", out_dir, None)  # automático (50)
+    assert report.kind == "text" and report.total_units == 130, report
+    assert len(report.parts) == 3, [p.label for p in report.parts]
+    assert [p.label for p in report.parts] == ["caps. 1-50", "caps. 51-100", "caps. 101-130"]
+    assert report.parts[0].name.startswith("novela_split - Parte 01 de 03")
+
+    first = report.parts[0].path.read_text("utf-8")
+    assert first.startswith("Novela de prueba"), "el prólogo debería abrir la primera sección"
+    assert "Capítulo 50: El comienzo" in first
+    assert "Capítulo 51: El comienzo" not in first
+    third = report.parts[2].path.read_text("utf-8")
+    assert third.startswith("Capítulo 101: El comienzo")
+
+    joined = "".join(part.path.read_text("utf-8") for part in report.parts)
+    assert joined == text, "la división pierde o duplica texto"
+
+    # «en 2 partes» reparte los capítulos a la mitad
+    report2 = split_document(src, "novela_split.txt", out_dir, SplitSpec("parts", 2))
+    assert len(report2.parts) == 2 and report2.units_per_part == 65, report2.units_per_part
+    assert report2.parts[1].label == "caps. 66-130"
+
+    # un libro sin capítulos detectables no se puede dividir
+    plain = WORK / "sin_capitulos.txt"
+    plain.write_text("Solo un párrafo\nsin ninguna estructura", "utf-8")
+    try:
+        split_document(plain, "sin_capitulos.txt", out_dir, None)
+    except SplitError as err:
+        assert "capítulos" in str(err)
+    else:
+        raise AssertionError("un TXT sin capítulos debería lanzar SplitError")
+
+    # pedir más capítulos por sección de los que hay tampoco vale
+    try:
+        split_document(src, "novela_split.txt", out_dir, SplitSpec("units", 500))
+    except SplitError as err:
+        assert "solo saldría 1" in str(err)
+    else:
+        raise AssertionError("una sección única debería lanzar SplitError")
+    print("OK · división de TXT:", [p.label for p in report.parts])
+
+
+async def test_split_epub() -> None:
+    src = WORK / "novela_split.epub"
+    out_dir = WORK / "split_epub"
+    shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    make_chapter_epub(src, chapters=12)
+
+    report = split_document(src, "novela_split.epub", out_dir, SplitSpec("units", 5))
+    assert report.kind == "epub" and report.total_units == 12, report
+    assert [p.label for p in report.parts] == ["caps. 1-5", "caps. 6-10", "caps. 11-12"]
+
+    with zipfile.ZipFile(report.parts[0].path) as zin:
+        names = zin.namelist()
+        assert names[0] == "mimetype", names[:2]
+        assert zin.getinfo("mimetype").compress_type == zipfile.ZIP_STORED
+        assert "OEBPS/ch1.xhtml" in names and "OEBPS/ch5.xhtml" in names
+        assert "OEBPS/ch6.xhtml" not in names, "la sección incluye capítulos que no le tocan"
+        assert "OEBPS/style.css" in names and "OEBPS/cover.png" in names
+        opf = zin.read("OEBPS/content.opf").decode("utf-8")
+        assert 'id="ch1"' in opf and 'id="ch6"' not in opf, opf
+        assert "Parte 1 de 3" in opf, opf
+        ncx = zin.read("OEBPS/toc.ncx").decode("utf-8")
+        assert ncx.count("<navPoint") == 5, ncx
+        nav = zin.read("OEBPS/nav.xhtml").decode("utf-8")
+        assert nav.count("<li>") == 5, nav
+        for name in names:
+            if name.endswith((".xhtml", ".ncx", ".opf")):
+                etree.fromstring(zin.read(name), XML_PARSER)
+
+    with zipfile.ZipFile(report.parts[2].path) as zin:
+        names = set(zin.namelist())
+        assert {"OEBPS/ch11.xhtml", "OEBPS/ch12.xhtml"} <= names
+        assert "OEBPS/ch10.xhtml" not in names
+
+    # cada sección es un EPUB válido que se puede traducir por separado
+    out = WORK / "novela_split_parte1_es.epub"
+    stats = await translate_epub(report.parts[0].path, out, MockTranslator("es"))
+    assert stats["units"] > 0, stats
+    with zipfile.ZipFile(out) as zin:
+        opf = zin.read("OEBPS/content.opf").decode("utf-8")
+        assert "Parte 1 de 3" in opf and "(ES)" in opf
+        chapter = zin.read("OEBPS/ch3.xhtml").decode("utf-8")
+        assert "[ES]" in chapter
+
+    # «en N partes» reparte a partes iguales
+    report2 = split_document(src, "novela_split.epub", out_dir, SplitSpec("parts", 2))
+    assert len(report2.parts) == 2 and report2.units_per_part == 6, report2.units_per_part
+    recovered = []
+    for part in report2.parts:
+        with zipfile.ZipFile(part.path) as zin:
+            recovered.extend(
+                name for name in zin.namelist() if name.startswith("OEBPS/ch") and name.endswith(".xhtml")
+            )
+    assert len(recovered) == 12 and len(set(recovered)) == 12, recovered
+    print("OK · división de EPUB:", [p.label for p in report.parts])
+
+
+async def test_split_pdf() -> None:
+    src = WORK / "libro_split.pdf"
+    out_dir = WORK / "split_pdf"
+    shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    make_sample_pdf(src, pages=6)
+
+    report = split_document(src, "libro_split.pdf", out_dir, SplitSpec("units", 2))
+    assert report.unit_noun == "páginas" and report.total_units == 6, report
+    assert [p.label for p in report.parts] == ["págs. 1-2", "págs. 3-4", "págs. 5-6"]
+    for part in report.parts:
+        with fitz.open(str(part.path)) as doc:
+            assert doc.page_count == 2, (part.name, doc.page_count)
+
+    # con índice (marcadores) se divide por capítulos
+    bookmarked = WORK / "libro_con_indice.pdf"
+    doc = fitz.open()
+    for _ in range(6):
+        doc.new_page()
+    doc.set_toc([[1, "Capítulo 1", 1], [1, "Capítulo 2", 3], [1, "Capítulo 3", 5]])
+    doc.save(str(bookmarked))
+    doc.close()
+
+    report2 = split_document(bookmarked, "libro_con_indice.pdf", out_dir, SplitSpec("units", 1))
+    assert report2.unit_noun == "capítulos" and report2.total_units == 3, report2
+    assert [p.label for p in report2.parts] == ["cap. 1", "cap. 2", "cap. 3"]
+    sizes = []
+    for part in report2.parts:
+        with fitz.open(str(part.path)) as piece:
+            sizes.append(piece.page_count)
+    assert sizes == [2, 2, 2], sizes
+    print("OK · división de PDF:", [p.label for p in report2.parts])
 
 
 # --------------------------------------------------------------------------- traductor
@@ -923,7 +1180,7 @@ def test_build_app() -> None:
         if isinstance(handler, CommandHandler)
         for command in handler.commands
     }
-    assert {"start", "help", "lang", "status", "cancel"} <= commands, commands
+    assert {"start", "help", "lang", "dividir", "status", "cancel"} <= commands, commands
     assert any(isinstance(handler, MessageHandler) for handler in handlers)
     assert app.error_handlers, "falta el manejador de errores"
     print("OK · aplicación de Telegram construida con", len(handlers), "handlers")
@@ -1033,6 +1290,37 @@ async def test_worker_integration() -> None:
         queue.put_nowait(cancelled)
         await asyncio.wait_for(queue.join(), timeout=30)
         assert any("cancelada" in edit.get("text", "") for edit in app.bot.edits)
+
+        # Modo división: parte el archivo en secciones sin traducir
+        split_id = "integracion03"
+        workdir3 = config.WORK_DIR / split_id
+        workdir3.mkdir(parents=True, exist_ok=True)
+        novel_src = workdir3 / "novela.txt"
+        make_novel_txt(novel_src, chapters=12)
+        split_task = DocumentTask(
+            task_id=split_id,
+            user_id=97,
+            chat_id=97,
+            status_message_id=8,
+            src_message_id=None,
+            src_path=novel_src,
+            file_name="novela.txt",
+            lang="es",
+            mode="split",
+            split_spec=SplitSpec("units", 5),
+        )
+        documents_before = len(app.bot.documents)
+        app.bot_data[bot_module._PENDING_KEY][97] = split_task
+        queue.put_nowait(split_task)
+        await asyncio.wait_for(queue.join(), timeout=60)
+        new_documents = app.bot.documents[documents_before:]
+        assert len(new_documents) == 3, new_documents
+        assert all("Parte" in doc["filename"] for doc in new_documents), new_documents
+        assert all("✂️" in doc["caption"] for doc in new_documents), new_documents
+        assert any(
+            "dividido en <b>3 partes</b>" in edit.get("text", "") for edit in app.bot.edits
+        ), "falta el resumen de la división"
+        assert not workdir3.exists(), "no se limpió el directorio temporal de la división"
     finally:
         worker.cancel()
         pipeline.create_translator = original_factory
@@ -1040,7 +1328,8 @@ async def test_worker_integration() -> None:
         pipeline._STORE = None
         shutil.rmtree(config.WORK_DIR / "integracion01", ignore_errors=True)
         shutil.rmtree(config.WORK_DIR / "integracion01b", ignore_errors=True)
-    print("OK · cola de trabajo, envío y caché (bot falso)")
+        shutil.rmtree(config.WORK_DIR / "integracion03", ignore_errors=True)
+    print("OK · cola de trabajo, envío, caché y división (bot falso)")
 
 
 async def test_real_google() -> None:
@@ -1094,6 +1383,10 @@ async def main() -> None:
         await test_epub_resume()
         await test_pdf_resume()
         await test_txt_resume()
+        test_split_command()
+        test_split_text()
+        await test_split_epub()
+        await test_split_pdf()
         await test_worker_integration()
         if real:
             await test_real_google()

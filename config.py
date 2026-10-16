@@ -59,6 +59,12 @@ WEB_MAX_INTERVAL: float = max(WEB_MIN_INTERVAL, _env_float("WEB_MAX_INTERVAL", 8
 # Documentos procesados a la vez (cada uno usa su propia concurrencia).
 MAX_CONCURRENT_JOBS: int = max(1, _env_int("MAX_CONCURRENT_JOBS", 1))
 
+# Divisor de novelas (/dividir): capítulos por sección (TXT/MD/EPUB), páginas
+# por sección (PDF sin índice) y máximo de secciones que se envían de una vez.
+SPLIT_CHAPTERS_PER_PART: int = max(1, _env_int("SPLIT_CHAPTERS_PER_PART", 50))
+SPLIT_PAGES_PER_PART: int = max(1, _env_int("SPLIT_PAGES_PER_PART", 100))
+SPLIT_MAX_PARTS: int = max(2, _env_int("SPLIT_MAX_PARTS", 100))
+
 # Tamaño máximo de entrada en MB. Los bots de Telegram no pueden descargar
 # archivos de más de 20 MB con getFile().
 MAX_INPUT_MB: int = max(1, _env_int("MAX_INPUT_MB", 20))

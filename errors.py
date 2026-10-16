@@ -12,3 +12,7 @@ class UnsupportedFormatError(RuntimeError):
 
 class ScannedPdfError(RuntimeError):
     """El PDF no contiene texto extraíble (probablemente es un escaneo)."""
+
+
+class SplitError(RuntimeError):
+    """El documento no se puede dividir en secciones (sin capítulos detectables)."""

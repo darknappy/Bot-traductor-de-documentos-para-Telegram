@@ -25,6 +25,7 @@ from checkpoints import JobStore, file_digest
 from epub_translate import translate_epub
 from errors import JobCancelledError, UnsupportedFormatError
 from pdf_translate import translate_pdf
+from splitter import SplitSpec, split_document
 from translator import BaseTranslator, create_translator
 
 logger = logging.getLogger(__name__)
@@ -38,7 +39,7 @@ _STORE: JobStore | None = None
 
 @dataclass
 class DocumentTask:
-    """Un documento recibido pendiente de traducir."""
+    """Un documento recibido pendiente de traducir o dividir en secciones."""
 
     task_id: str
     user_id: int
@@ -48,6 +49,8 @@ class DocumentTask:
     src_path: Path
     file_name: str
     lang: str
+    mode: str = "translate"  # "translate" | "split"
+    split_spec: SplitSpec | None = None
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     started_at: float = 0.0
 
@@ -62,6 +65,14 @@ class JobResult:
     out_path: Path
     out_name: str
     caption: str
+
+
+@dataclass
+class SplitOutcome:
+    """Resultado de dividir un documento: varias secciones y un resumen."""
+
+    parts: list[JobResult]
+    summary: str
 
 
 # --------------------------------------------------------------------------- utilidades
@@ -341,3 +352,36 @@ async def process_job(task: DocumentTask, progress: ProgressCallback) -> JobResu
         cached_path = upload_path
 
     return JobResult(out_path=cached_path, out_name=upload_name, caption=caption)
+
+
+# --------------------------------------------------------------------------- división en secciones
+
+
+async def process_split_job(task: DocumentTask, progress: ProgressCallback) -> SplitOutcome:
+    """Parte el documento en secciones sin traducir (comando /dividir)."""
+    await progress(0.05, "detectando capítulos…")
+    report = await asyncio.to_thread(
+        split_document,
+        task.src_path,
+        task.file_name,
+        task.src_path.parent,
+        task.split_spec,
+        task.cancelled,
+    )
+    count = len(report.parts)
+    parts: list[JobResult] = []
+    for part in report.parts:
+        caption = f"✂️ <b>Parte {part.index} de {count}</b> · {html.escape(part.label)}"
+        parts.append(JobResult(out_path=part.path, out_name=part.name, caption=caption))
+
+    summary_lines = [
+        f"✅ <b>{html.escape(task.file_name)}</b> dividido en <b>{count} partes</b>",
+        f"📚 {format_number(report.total_units)} {report.unit_noun} · "
+        f"{format_number(report.units_per_part)} por sección",
+        "➡️ Envíame cada parte como un archivo normal para traducirla por separado.",
+        "💡 Si una falla o el bot se reinicia, solo reenvías esa parte.",
+    ]
+    for note in report.notes:
+        summary_lines.append(f"ℹ️ {html.escape(note)}.")
+    logger.info("División de %s: %d secciones de %d %s", task.file_name, count, report.units_per_part, report.unit_noun)
+    return SplitOutcome(parts=parts, summary="\n".join(summary_lines))

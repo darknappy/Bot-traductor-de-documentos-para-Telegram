@@ -488,3 +488,11 @@ async def translate_epub(
                         shutil.copyfileobj(source, target, length=1024 * 1024)
 
     return stats
+
+
+# --------------------------------------------------------------------------- alias públicos
+
+
+# El divisor de novelas (splitter.py) reutiliza estos ayudantes ya probados.
+check_drm = _check_drm
+find_opf = _find_opf

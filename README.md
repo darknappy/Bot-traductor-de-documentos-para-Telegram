@@ -11,11 +11,15 @@ los devuelve traducidos. También traduce mensajes de texto sueltos.
   lectura y los índices (NCX y navegación). El resto de archivos se copia byte
   a byte.
 - **TXT / MD** → texto plano traducido línea a línea.
+- **✂️ /dividir** → parte una novela larga en secciones **sin traducir** (EPUB
+  por capítulos, TXT/MD por sus encabezados, PDF por índice o páginas) para
+  traducirlas por separado y reenviar solo la que falle.
 
 Pensado también para **novelas web de gran volumen (+1000 capítulos)**: traduce
 por lotes, **si Google limita la velocidad cambia solo a Microsoft** (cuota
 independiente), muestra el progreso también **dentro de cada capítulo**, guarda
-el progreso capítulo a capítulo y **reanuda** donde se quedó.
+el progreso capítulo a capítulo, **reanuda** donde se quedó y puede **dividir la
+novela en secciones** para que un fallo solo cueste reenviar una parte.
 
 ---
 
@@ -148,18 +152,41 @@ services:
 | `/start`, `/help` | Ayuda y estado actual |
 | `/lang` | Teclado para elegir el idioma de destino |
 | `/lang en` | Cambia el idioma directamente (cualquier código de Google: `pt`, `fr`, `ja`, `zh`, `ar`…) |
+| `/dividir` | El próximo archivo se parte en secciones sin traducir |
+| `/dividir 25` | …en secciones de 25 capítulos (en PDF, 25 páginas) |
+| `/dividir 8 partes` | …en 8 secciones iguales |
 | `/status` | Cola, tareas en curso y tamaño de la caché |
 | `/cancel` | Cancela la tarea en curso |
 
 También puedes escribirle un texto normal y te lo traduce al momento.
+
+### ✂️ Dividir novelas en secciones (`/dividir`)
+
+Para novelas enormes es más cómodo trabajar por secciones. Envía `/dividir` y
+después el archivo (o directamente el archivo con la leyenda «`/dividir 25`» en
+el pie de foto) y el bot te devuelve el libro **sin traducir** troceado:
+
+- **EPUB** → un EPUB válido por sección, con su índice (NCX/navegación)
+  recortado, estilos e imágenes intactos y el título marcado como
+  «Libro — Parte 3 de 8». Los capítulos se detectan por el *spine* del libro.
+- **TXT / MD** → corta por los encabezados («Capítulo 12», «Chapter 12»,
+  «第12章», «12화»…). Los índices al principio del archivo se ignoran.
+- **PDF** → usa los marcadores/índice del PDF si los tiene; si no, corta por
+  páginas.
+
+Después envía cada sección como un archivo normal: se traduce por separado, se
+guarda en la caché por separado y, si algo falla o el bot se reinicia, **solo
+reenvías esa sección** en lugar de la novela completa (perfecto para el plan
+gratuito con disco efímero).
 
 ---
 
 ## Novelas largas: qué tener en cuenta
 
 - **Límite de Telegram**: los bots solo pueden descargar archivos de hasta
-  **20 MB**. Para obras gigantes, divide el libro (por ejemplo un EPUB cada
-  ~500 capítulos) y envía las partes por separado.
+  **20 MB**. Para obras gigantes usa **`/dividir`**: trocea el libro en
+  secciones (por ejemplo de 50 capítulos) y envía las partes por separado; así
+  ninguna se acerca al límite y, si algo falla, solo reenvías una parte.
 - **Reanudación**: el progreso se guarda por capítulos (EPUB), por páginas
   (PDF) y por párrafos (TXT). Si el proceso se reinicia o lo cancelas, al
   reenviar el mismo archivo continúa por donde iba en lugar de empezar de cero.
@@ -232,6 +259,11 @@ petición y sin límites agresivos.
   el título lleva el sufijo del idioma. El progreso avanza **documento a
   documento y fragmento a fragmento**, así que la barra se mueve aunque un
   capítulo tarde varios minutos.
+- **Divisor de novelas** (`splitter.py`): detecta los capítulos (spine del
+  EPUB, encabezados del TXT/MD, índice o páginas del PDF) y genera secciones
+  independientes: en el EPUB se recorta el índice NCX/navegación, se ajustan
+  las referencias y los capítulos que no van en la sección se eliminan del
+  paquete (los estilos, imágenes y demás recursos se copian intactos).
 - **Cola de trabajo**: las tareas se procesan en cola (1 a la vez por defecto)
   para no saturar el traductor; varios usuarios pueden enviar documentos.
 
@@ -244,6 +276,7 @@ translator.py       # traductores web gratuitos (Google + Microsoft) y relevo
 translator_api.py   # backend opcional con la API oficial de Google Cloud
 pdf_translate.py    # traducción de PDF conservando el diseño
 epub_translate.py   # traducción de EPUB conservando estructura y estilos
+splitter.py         # detector de capítulos y divisor de novelas en secciones
 checkpoints.py      # progreso persistente por documento y caché de resultados
 health.py           # servidor HTTP de salud para Render (/health, /status)
 languages.py        # catálogo de idiomas
@@ -269,6 +302,9 @@ data/               # (se crea sola) trabajo, progreso y caché
 | `MAX_CONCURRENT_JOBS` | `1` | Documentos traducidos a la vez |
 | `MAX_INPUT_MB` | `20` | Tamaño máximo de entrada |
 | `MAX_OUTPUT_MB` | `48` | Tamaño máximo de salida |
+| `SPLIT_CHAPTERS_PER_PART` | `50` | Capítulos por sección en `/dividir` (TXT/MD/EPUB) |
+| `SPLIT_PAGES_PER_PART` | `100` | Páginas por sección en PDF sin índice |
+| `SPLIT_MAX_PARTS` | `100` | Máximo de secciones que genera `/dividir` |
 | `DATA_DIR` | `data` | Carpeta de trabajo, progreso y caché |
 | `CACHE_TTL_DAYS` | `7` | Días que se guarda un resultado ya traducido |
 | `CACHE_MAX_MB` | `512` | Tamaño máximo de la caché |
@@ -285,13 +321,14 @@ Las pruebas verifican: reemplazo real del texto (sin duplicarlo), conservación
 de imágenes/colores/negritas en PDF, conservación de enlaces, cursivas,
 `&nbsp;`, índices y metadatos en EPUB, detección de escaneos y DRM,
 cancelación, agrupación en lotes, reintentos tras bloqueos, reanudación de
-EPUB/PDF/TXT a medias, la caché de resultados, el servidor de salud y la cola
+EPUB/PDF/TXT a medias, la caché de resultados, el divisor de novelas
+(capítulos, secciones válidas y sin pérdidas), el servidor de salud y la cola
 de trabajo completa con un bot falso.
 
 ## Limitaciones (importante)
 
 - **Tamaño**: los bots de Telegram no pueden descargar archivos de más de
-  **20 MB**. Para libros mayores, divide el documento en partes.
+  **20 MB**. Para libros mayores usa **`/dividir`** y envía las secciones.
 - **PDF escaneado**: este bot no hace OCR. Si el PDF es una imagen escaneada
   (sin capa de texto) el bot te lo avisa.
 - **EPUB con DRM**: no se puede traducir (el bot lo detecta y avisa).
