@@ -1,8 +1,8 @@
-"""Bot de Telegram que traduce documentos (PDF, EPUB, TXT, MD) con Google y Microsoft.
+"""Bot de Telegram que traduce documentos (PDF, EPUB, TXT, MD) con Google, Microsoft y DeepL.
 
 Incluye un menú fijo de botones, un divisor de novelas (/dividir) para trabajar por
-secciones en libros enormes y el modo «dividir y traducir» (secciones + cada una
-traducida por separado).
+secciones en libros enormes, el modo «dividir y traducir» (secciones + cada una
+traducida por separado) y la elección de motor de traducción por usuario.
 
 Uso:
     1. Copia .env.example a .env y pega el token de @BotFather.
@@ -54,7 +54,14 @@ from pipeline import (
     safe_filename,
 )
 from splitter import SplitPart, SplitSpec, describe_spec, parse_split_command
-from translator import TranslationError, active_engine, create_translator
+from translator import (
+    TranslationError,
+    active_engine,
+    create_translator,
+    deepl_supported,
+    engine_label,
+    normalize_engine,
+)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -79,6 +86,7 @@ MENU_TRANSLATE = "🌐 Traducir"
 MENU_SPLIT = "✂️ Dividir"
 MENU_BOTH = "🔀 Dividir y traducir"
 MENU_LANG = "⚙️ Idioma"
+MENU_ENGINE = "🧠 Motor"
 MENU_STATUS = "📊 Estado"
 MENU_CANCEL = "🚫 Cancelar"
 MENU_HELP = "❓ Ayuda"
@@ -87,6 +95,7 @@ MENU_LABELS = (
     MENU_SPLIT,
     MENU_BOTH,
     MENU_LANG,
+    MENU_ENGINE,
     MENU_STATUS,
     MENU_CANCEL,
     MENU_HELP,
@@ -213,10 +222,13 @@ def main_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(MENU_BOTH, api_kwargs=_style("primary"))],
             [
                 KeyboardButton(MENU_LANG),
+                KeyboardButton(MENU_ENGINE),
                 KeyboardButton(MENU_STATUS),
-                KeyboardButton(MENU_CANCEL, api_kwargs=_style("danger")),
             ],
-            [KeyboardButton(MENU_HELP)],
+            [
+                KeyboardButton(MENU_CANCEL, api_kwargs=_style("danger")),
+                KeyboardButton(MENU_HELP),
+            ],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -230,7 +242,7 @@ def _mode_markup() -> InlineKeyboardMarkup:
     )
 
 
-def _file_action_keyboard(token: str) -> InlineKeyboardMarkup:
+def _file_action_keyboard(token: str, engine: str = "auto") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
@@ -242,6 +254,12 @@ def _file_action_keyboard(token: str) -> InlineKeyboardMarkup:
                     "🔀 Dividir y traducir cada parte",
                     callback_data=f"fx:{token}:b",
                     api_kwargs=_style("primary"),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"🧠 Motor: {engine_label(engine)}",
+                    callback_data=f"fx:{token}:e",
                 )
             ],
             [
@@ -294,6 +312,77 @@ def _chapters_text(file_name: str | None = None) -> str:
     )
 
 
+# --- Motor de traducción (selector por usuario) ---------------------------------
+
+# Opciones del selector: código, nombre del botón y explicación corta.
+_ENGINE_CHOICES: tuple[tuple[str, str, str], ...] = (
+    ("auto", "🔄 Automático", "Google primero; si se bloquea, continúa Microsoft o DeepL"),
+    ("google", "🔵 Solo Google", "El más rápido y estable; sin relevo"),
+    ("microsoft", "🟣 Solo Microsoft", "El relevo clásico cuando Google falla"),
+    ("deepl", "🟢 Solo DeepL", "La mejor calidad; traduce más despacio"),
+)
+_ENGINE_SHORT = {code: label for code, label, _desc in _ENGINE_CHOICES}
+
+
+def _engine_markup(current: str, *, token: str | None = None, lang: str | None = None) -> InlineKeyboardMarkup:
+    """Botones del selector de motor (en el menú o para un archivo pendiente).
+
+    Con ``token`` los botones empiezan por ``fe:`` y llevan «Volver» a la
+    pregunta del archivo; sin él (menú o /motor) empiezan por ``eng:``.
+    """
+    code = normalize_engine(current) or "auto"
+    prefix = f"fe:{token}" if token else "eng"
+    rows = []
+    for choice, label, _desc in _ENGINE_CHOICES:
+        if choice == "deepl" and lang is not None and not deepl_supported(lang):
+            continue  # DeepL no soporta ese idioma: mejor no ofrecerlo
+        mark = "✅ " if choice == code else ""
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{mark}{label}",
+                    callback_data=f"{prefix}:{choice}",
+                    api_kwargs=_style("success" if choice == code else "primary"),
+                )
+            ]
+        )
+    if token:
+        rows.append([InlineKeyboardButton("🔙 Volver", callback_data=f"fx:{token}:v")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _engine_menu_text(current: str, lang: str) -> str:
+    code = normalize_engine(current) or "auto"
+    lines = [
+        "🧠 <b>Motor de traducción</b>",
+        f"<blockquote>Ahora mismo: <b>{html.escape(engine_label(code))}</b> · "
+        f"🌐 → {html.escape(languages.language_name(lang))}</blockquote>",
+    ]
+    for choice, label, desc in _ENGINE_CHOICES:
+        if choice == "deepl" and not deepl_supported(lang):
+            continue
+        mark = "✅" if choice == code else "▪️"
+        lines.append(f"{mark} {label} — {html.escape(desc)}")
+    if not deepl_supported(lang):
+        lines.append("ℹ️ DeepL no traduce a este idioma, así que no aparece.")
+    lines.append(
+        "<blockquote>💡 Afecta a tus próximas traducciones; las tareas en curso no "
+        "cambian. También vale <code>/motor google</code>, <code>/motor deepl</code>…</blockquote>"
+    )
+    return "\n".join(lines)
+
+
+def _fix_engine_for_lang(user_id: int, lang: str) -> str | None:
+    """Si el motor elegido no traduce al idioma nuevo, vuelve a Automático.
+
+    Devuelve una nota para el mensaje, o ``None`` si no hubo que tocar nada.
+    """
+    if users.get_engine(user_id) == "deepl" and not deepl_supported(lang):
+        users.set_engine(user_id, "auto")
+        return "motor a Automático (DeepL no traduce a ese idioma)"
+    return None
+
+
 # --------------------------------------------------------------------------- mensajes
 
 
@@ -301,13 +390,15 @@ def help_text(lang: str) -> str:
     return (
         "🌍 <b>Bot traductor de documentos</b>\n"
         "Traduzco <b>PDF · EPUB · TXT · MD</b> y mensajes sueltos con los traductores\n"
-        "gratuitos de Google y Microsoft.\n\n"
+        "gratuitos de <b>Google</b>, <b>Microsoft</b> y <b>DeepL</b>.\n\n"
         "<blockquote>🌐 <b>Traducir</b> — conserva el diseño del PDF y los capítulos, "
         "estilos y enlaces del EPUB.\n"
         "✂️ <b>Dividir</b> — parte una novela larga en secciones <i>sin traducir</i> "
         "(ideal para +100 capítulos).\n"
         "🔀 <b>Dividir y traducir</b> — elige 25/50/75/100 capítulos por sección: te "
-        "manda las secciones y después traduce cada una.</blockquote>\n\n"
+        "manda las secciones y después traduce cada una.\n"
+        "🧠 <b>Motor</b> — decide quién traduce: automático (Google primero y relevo), "
+        "solo Google, solo Microsoft o solo DeepL.</blockquote>\n\n"
         f"🌐 Idioma de destino: <b>{html.escape(languages.language_name(lang))}</b> · "
         "cámbialo con ⚙️ <b>Idioma</b>\n\n"
         "<blockquote expandable>💡 <b>Trucos y comandos</b>\n"
@@ -320,23 +411,25 @@ def help_text(lang: str) -> str:
         f"• Tamaño máximo por archivo: {config.MAX_INPUT_MB} MB (límite de Telegram).\n"
         "• Los libros enormes guardan el progreso: reenvía el mismo archivo y continúo "
         "donde iba.\n"
-        "• Mientras traduzco verás con qué motor trabajo (Google o Microsoft).\n"
-        "• Comandos: /lang · /dividir · /status · /cancel · /help</blockquote>"
+        "• Mientras traduzco verás con qué motor trabajo (Google, Microsoft o DeepL).\n"
+        "• Comandos: /lang · /motor · /dividir · /status · /cancel · /help</blockquote>"
     )
 
 
-def status_text() -> str:
+def status_text(preference: str | None = None) -> str:
     """Resumen del estado del bot (se usa en /status)."""
     snapshot = _status_snapshot()
     active = snapshot.get("active") or []
     engine = active_engine()
     engine_line = f"\n🛰️ Traduciendo con <b>{html.escape(engine[1])}</b>" if engine else ""
+    pref_name = engine_label(preference) if preference else "Automático (por defecto)"
     lines = [
         "📊 <b>Estado del bot</b>",
         "<blockquote>"
         f"🟢 Activo desde hace {format_duration(snapshot.get('uptime_seconds', 0))}\n"
-        f"⚙️ Motor: <code>{html.escape(str(config.TRANSLATOR_BACKEND))}</code> · "
+        f"⚙️ Servidor: <code>{html.escape(str(config.TRANSLATOR_BACKEND))}</code> · "
         f"{config.TRANSLATE_CONCURRENCY} traducciones en paralelo\n"
+        f"🧠 Tu motor: <b>{html.escape(pref_name)}</b>\n"
         f"📥 En cola: {snapshot.get('queue', 0)} · 🧵 En proceso: {len(active)}"
         f"{engine_line}\n"
         f"💾 Resultados guardados: {snapshot.get('cache_files', 0)} archivo(s) · "
@@ -394,24 +487,31 @@ def _kind_label(file_name: str) -> str:
     }.get(Path(file_name).suffix.lower(), "📁 Archivo")
 
 
-def _task_header(file_name: str, size: int, mode: str, lang: str) -> str:
+def _task_header(file_name: str, size: int, mode: str, lang: str, engine: str = "auto") -> str:
     if mode == "split":
         action = "✂️ Se partirá en secciones sin traducir"
     elif mode == "both":
-        action = "🔀 Se dividirá y se traducirá cada parte"
+        action = (
+            "🔀 Se dividirá y se traducirá cada parte · "
+            f"🧠 {html.escape(engine_label(engine))}"
+        )
     else:
-        action = f"🌐 → {html.escape(languages.language_name(lang))}"
+        action = (
+            f"🌐 → {html.escape(languages.language_name(lang))} · "
+            f"🧠 {html.escape(engine_label(engine))}"
+        )
     return (
         f"📥 <b>{html.escape(file_name)}</b>\n"
         f"<blockquote>📦 {size / 1048576:.1f} MB · {_kind_label(file_name)}\n{action}</blockquote>"
     )
 
 
-def _file_question_text(file_name: str, size: int, lang: str) -> str:
+def _file_question_text(file_name: str, size: int, lang: str, engine: str = "auto") -> str:
     return (
         f"📄 <b>{html.escape(file_name)}</b>\n"
         f"<blockquote>📦 {size / 1048576:.1f} MB · {_kind_label(file_name)} · "
-        f"🌐 → {html.escape(languages.language_name(lang))}</blockquote>\n"
+        f"🌐 → {html.escape(languages.language_name(lang))} · "
+        f"🧠 {html.escape(engine_label(engine))}</blockquote>\n"
         "❓ <b>¿Qué quieres que haga con este archivo?</b>\n"
         "<i>No haré nada hasta que elijas.</i>"
     )
@@ -427,7 +527,7 @@ def _part_caption(part: SplitPart, status: str = "split") -> str:
     return base
 
 
-def _mode_confirmation(mode: str, lang: str, spec: SplitSpec | None) -> str:
+def _mode_confirmation(mode: str, lang: str, spec: SplitSpec | None, engine: str | None = None) -> str:
     if mode == "split":
         return (
             "✂️ <b>Modo división activado</b>\n"
@@ -445,11 +545,13 @@ def _mode_confirmation(mode: str, lang: str, spec: SplitSpec | None) -> str:
             "<blockquote>🧩 Cada sección se traduce por separado: si una falla, las demás "
             "quedan hechas.</blockquote>"
         )
+    motor = f"🧠 Motor: <b>{html.escape(engine_label(engine))}</b>\n" if engine else ""
     return (
         "🌐 <b>Modo traducción activado</b>\n"
         f"El próximo archivo se traducirá a <b>{html.escape(languages.language_name(lang))}</b> "
         "conservando su formato.\n"
-        "<blockquote>💡 Si prefieres decidir después, desactiva el modo: al enviarme un "
+        f"<blockquote>{motor}"
+        "💡 Si prefieres decidir después, desactiva el modo: al enviarme un "
         "archivo te preguntaré qué hacer.</blockquote>"
     )
 
@@ -596,9 +698,11 @@ async def cmd_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
         users.set_lang(user.id, code)
+        note = _fix_engine_for_lang(user.id, code)
         await update.message.reply_text(
             f"✅ Idioma de destino: <b>{html.escape(languages.language_name(code))}</b> "
-            f"(<code>{html.escape(code)}</code>).",
+            f"(<code>{html.escape(code)}</code>)."
+            + (f"\n🔄 Cambié el {note}." if note else ""),
             parse_mode=ParseMode.HTML,
         )
         return
@@ -607,11 +711,80 @@ async def cmd_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_html(update.message.reply_text, _lang_menu_text(current), _lang_menu_markup(current))
 
 
+async def cmd_motor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/motor: elige el motor de traducción (auto, google, microsoft, deepl)."""
+    user = update.effective_user
+    lang = users.get_lang(user.id)
+    args = context.args or []
+    if args:
+        code = normalize_engine(args[0])
+        if code is None:
+            await update.message.reply_text(
+                "❌ Motor no válido. Opciones: <code>/motor auto</code>, "
+                "<code>/motor google</code>, <code>/motor microsoft</code> o "
+                "<code>/motor deepl</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if code == "deepl" and not deepl_supported(lang):
+            await update.message.reply_text(
+                f"❌ DeepL no traduce a <b>{html.escape(languages.language_name(lang))}</b>. "
+                "Cambia de idioma con /lang o elige otro motor.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        users.set_engine(user.id, code)
+        extra = (
+            " (Google primero; si se bloquea, continúa Microsoft o DeepL)"
+            if code == "auto"
+            else ""
+        )
+        await update.message.reply_text(
+            f"✅ Motor de traducción: <b>{html.escape(engine_label(code))}</b>{extra}.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    current = users.get_engine(user.id)
+    await _send_html(
+        update.message.reply_text,
+        _engine_menu_text(current, lang),
+        _engine_markup(current, lang=lang),
+    )
+
+
+async def on_engine_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Botones del selector de motor (🧠 Motor o /motor)."""
+    query = update.callback_query
+    user = query.from_user
+    code = normalize_engine((query.data or "").split(":", 1)[-1])
+    if code is None:
+        await query.answer()
+        return
+    lang = users.get_lang(user.id)
+    if code == "deepl" and not deepl_supported(lang):
+        await query.answer(
+            f"DeepL no traduce a {languages.language_name(lang)}.", show_alert=True
+        )
+        return
+    users.set_engine(user.id, code)
+    await query.answer(f"Motor: {engine_label(code)}")
+    try:
+        await _send_html(
+            query.edit_message_text,
+            _engine_menu_text(code, lang),
+            _engine_markup(code, lang=lang),
+        )
+    except TelegramError:
+        pass
+
+
 async def on_lang_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     code = languages.normalize((query.data or "").split(":", 1)[-1]) or "es"
     users.set_lang(query.from_user.id, code)
-    await query.answer(f"Idioma: {languages.language_name(code)}")
+    note = _fix_engine_for_lang(query.from_user.id, code)
+    await query.answer(f"Idioma: {languages.language_name(code)}" + (f" · {note}" if note else ""))
     try:
         await _send_html(query.edit_message_text, _lang_menu_text(code), _lang_menu_markup(code))
     except TelegramError:
@@ -631,7 +804,8 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _send_html(update.message.reply_text, status_text(), _status_markup())
+    engine = users.get_engine(update.effective_user.id)
+    await _send_html(update.message.reply_text, status_text(engine), _status_markup())
 
 
 async def cmd_dividir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -656,8 +830,13 @@ async def cmd_dividir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def cmd_traducir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/traducir: el próximo documento se traduce directamente."""
     context.user_data["file_action"] = {"mode": "translate", "spec": None}
-    lang = users.get_lang(update.effective_user.id)
-    await _send_html(update.message.reply_text, _mode_confirmation("translate", lang, None), _mode_markup())
+    user = update.effective_user
+    lang = users.get_lang(user.id)
+    await _send_html(
+        update.message.reply_text,
+        _mode_confirmation("translate", lang, None, users.get_engine(user.id)),
+        _mode_markup(),
+    )
 
 
 async def cmd_ambos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -672,7 +851,11 @@ async def cmd_ambos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     spec = parse_split_command("/dividir " + " ".join(args))
     context.user_data["file_action"] = {"mode": "both", "spec": spec}
     lang = users.get_lang(update.effective_user.id)
-    await _send_html(update.message.reply_text, _mode_confirmation("both", lang, spec), _mode_markup())
+    await _send_html(
+        update.message.reply_text,
+        _mode_confirmation("both", lang, spec, users.get_engine(update.effective_user.id)),
+        _mode_markup(),
+    )
 
 
 async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -690,7 +873,11 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     }.get(label)
     if mode is not None:
         context.user_data["file_action"] = {"mode": mode, "spec": None}
-        await _send_html(message.reply_text, _mode_confirmation(mode, lang, None), _mode_markup())
+        await _send_html(
+            message.reply_text,
+            _mode_confirmation(mode, lang, None, users.get_engine(user.id)),
+            _mode_markup(),
+        )
         return
     if label == MENU_BOTH:
         # Nada de tamaño automático: se elige con botones.
@@ -699,8 +886,12 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if label == MENU_LANG:
         await _send_html(message.reply_text, _lang_menu_text(lang), _lang_menu_markup(lang))
         return
+    if label == MENU_ENGINE:
+        current = users.get_engine(user.id)
+        await _send_html(message.reply_text, _engine_menu_text(current, lang), _engine_markup(current, lang=lang))
+        return
     if label == MENU_STATUS:
-        await _send_html(message.reply_text, status_text(), _status_markup())
+        await _send_html(message.reply_text, status_text(users.get_engine(user.id)), _status_markup())
         return
     if label == MENU_CANCEL:
         await cmd_cancel(update, context)
@@ -726,7 +917,11 @@ async def on_status_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     query = update.callback_query
     await query.answer("Estado actualizado")
     try:
-        await _send_html(query.edit_message_text, status_text(), _status_markup())
+        await _send_html(
+            query.edit_message_text,
+            status_text(users.get_engine(query.from_user.id)),
+            _status_markup(),
+        )
     except TelegramError:
         pass
 
@@ -766,7 +961,8 @@ async def _ask_file_action(
     if both_count:
         text, markup = _chapters_text(file_name), _chapters_markup(token)
     else:
-        text, markup = _file_question_text(file_name, size, lang), _file_action_keyboard(token)
+        engine = users.get_engine(user.id)
+        text, markup = _file_question_text(file_name, size, lang, engine), _file_action_keyboard(token, engine)
     question = await _send_html(message.reply_text, text, markup)
     store[user.id] = {
         "token": token,
@@ -843,7 +1039,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def on_file_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Botones 🌐 ✂️ 🔀 🗑️ del mensaje «¿qué hago con este archivo?»."""
+    """Botones 🌐 ✂️ 🔀 🧠 🗑️ del mensaje «¿qué hago con este archivo?»."""
     query = update.callback_query
     user = query.from_user
     parts = (query.data or "").split(":")
@@ -864,11 +1060,27 @@ async def on_file_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if action == "v":  # volver a la pregunta inicial
         await query.answer()
+        lang = users.get_lang(user.id)
+        engine = users.get_engine(user.id)
         try:
             await _send_html(
                 query.edit_message_text,
-                _file_question_text(entry["file_name"], entry["size"], users.get_lang(user.id)),
-                _file_action_keyboard(token),
+                _file_question_text(entry["file_name"], entry["size"], lang, engine),
+                _file_action_keyboard(token, engine),
+            )
+        except TelegramError:
+            pass
+        return
+
+    if action == "e":  # elegir motor sin salir de la pregunta del archivo
+        await query.answer("Elige el motor de traducción")
+        lang = users.get_lang(user.id)
+        engine = users.get_engine(user.id)
+        try:
+            await _send_html(
+                query.edit_message_text,
+                _engine_menu_text(engine, lang),
+                _engine_markup(engine, token=token, lang=lang),
             )
         except TelegramError:
             pass
@@ -914,6 +1126,39 @@ async def on_file_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reply_source=None,
         )
     )
+
+
+async def on_file_engine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Motor elegido desde la pregunta de un archivo pendiente (🧠 Motor)."""
+    query = update.callback_query
+    user = query.from_user
+    parts = (query.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "fe":
+        return
+    token = parts[1]
+    code = normalize_engine(parts[2])
+    store: dict = context.application.bot_data.get(_PENDING_FILES_KEY) or {}
+    entry = store.get(user.id)
+    if entry is None or entry.get("token") != token:
+        await query.answer("Esa selección ya no está activa: reenvía el archivo.", show_alert=True)
+        return
+    if code is None:
+        await query.answer()
+        return
+    lang = users.get_lang(user.id)
+    if code == "deepl" and not deepl_supported(lang):
+        await query.answer(f"DeepL no traduce a {languages.language_name(lang)}.", show_alert=True)
+        return
+    users.set_engine(user.id, code)
+    await query.answer(f"Motor: {engine_label(code)}")
+    try:
+        await _send_html(
+            query.edit_message_text,
+            _file_question_text(entry["file_name"], entry["size"], lang, code),
+            _file_action_keyboard(token, code),
+        )
+    except TelegramError:
+        pass
 
 
 async def on_file_both_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -967,7 +1212,12 @@ async def on_menu_both_count(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         await _send_html(
             query.edit_message_text,
-            _mode_confirmation("both", users.get_lang(query.from_user.id), spec),
+            _mode_confirmation(
+                "both",
+                users.get_lang(query.from_user.id),
+                spec,
+                users.get_engine(query.from_user.id),
+            ),
             _mode_markup(),
         )
     except TelegramError:
@@ -1000,6 +1250,7 @@ async def _start_task(
     dest = workdir / file_name
 
     lang = users.get_lang(user_id)
+    engine = users.get_engine(user_id)
     task = DocumentTask(
         task_id=task_id,
         user_id=user_id,
@@ -1009,6 +1260,7 @@ async def _start_task(
         src_path=dest,
         file_name=file_name,
         lang=lang,
+        engine=engine,
         mode=mode,
         split_spec=spec if mode in {"split", "both"} else None,
     )
@@ -1028,7 +1280,7 @@ async def _start_task(
             return
         pending[user_id] = task
 
-    header = _task_header(file_name, size, mode, lang)
+    header = _task_header(file_name, size, mode, lang, engine)
     if status_message_id is None:
         status = await _send_html(reply_source.reply_text, header + "\n\n⬇️ Descargando…")
         task.status_message_id = status_message_id = status.message_id
@@ -1080,13 +1332,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     lang = users.get_lang(update.effective_user.id)
+    engine = users.get_engine(update.effective_user.id)
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     try:
-        async with create_translator(lang, concurrency=2) as translator:
+        async with create_translator(lang, concurrency=2, engine=engine) as translator:
             translated = await translator.translate(text)
     except TranslationError as err:
         await message.reply_text(
-            f"❌ Fallaron los traductores gratuitos (Google y Microsoft): {html.escape(str(err))}\n"
+            f"❌ Fallaron los traductores gratuitos (Google, Microsoft y DeepL): {html.escape(str(err))}\n"
             "Puede ser un bloqueo temporal por exceso de peticiones; inténtalo de nuevo en unos minutos."
         )
         return
@@ -1171,6 +1424,7 @@ async def _run_split_and_translate(bot, task: DocumentTask, reporter: ProgressRe
             src_path=part.path,
             file_name=part.name,
             lang=task.lang,
+            engine=task.engine,
             mode="translate",
         )
         sub.cancel_event = task.cancel_event
@@ -1283,7 +1537,7 @@ async def _worker(app: Application) -> None:
             await _safe_edit(
                 bot,
                 task,
-                f"❌ Fallaron los traductores gratuitos (Google y Microsoft): {html.escape(str(err))}\n"
+                f"❌ Fallaron los traductores gratuitos (Google, Microsoft y DeepL): {html.escape(str(err))}\n"
                 "Puede ser un bloqueo temporal por exceso de peticiones; vuelve a intentarlo más tarde.",
             )
         except Exception:  # noqa: BLE001
@@ -1305,6 +1559,7 @@ async def _post_init(app: Application) -> None:
         [
             BotCommand("start", "Menú principal y cómo funciona"),
             BotCommand("lang", "Cambiar el idioma de destino"),
+            BotCommand("motor", "Elegir el motor de traducción"),
             BotCommand("traducir", "Traducir el próximo archivo"),
             BotCommand("dividir", "Partir una novela larga en secciones"),
             BotCommand("ambos", "Dividir y traducir cada parte"),
@@ -1319,7 +1574,7 @@ async def _post_init(app: Application) -> None:
         )
         await app.bot.set_my_description(
             "Envíame un documento (PDF, EPUB, TXT o MD) y te lo devuelvo traducido con los "
-            "traductores gratuitos de Google y Microsoft, conservando el diseño y los capítulos.\n\n"
+            "traductores gratuitos de Google, Microsoft y DeepL, conservando el diseño y los capítulos.\n\n"
             "✂️ Con «Dividir» troceo novelas de +100 capítulos en secciones para traducirlas por "
             "separado y reanudar donde se quedó.\n"
             "🔀 Con «Dividir y traducir» te envío todas las secciones y después cada una traducida.\n\n"
@@ -1392,13 +1647,16 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("lang", cmd_lang))
+    app.add_handler(CommandHandler("motor", cmd_motor, filters=no_document))
     app.add_handler(CommandHandler("traducir", cmd_traducir, filters=no_document))
     app.add_handler(CommandHandler("dividir", cmd_dividir, filters=no_document))
     app.add_handler(CommandHandler("ambos", cmd_ambos, filters=no_document))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(on_lang_button, pattern=r"^lang:"))
+    app.add_handler(CallbackQueryHandler(on_engine_button, pattern=r"^eng:"))
     app.add_handler(CallbackQueryHandler(on_file_action, pattern=r"^fx:"))
+    app.add_handler(CallbackQueryHandler(on_file_engine, pattern=r"^fe:"))
     app.add_handler(CallbackQueryHandler(on_file_both_count, pattern=r"^fbc:"))
     app.add_handler(CallbackQueryHandler(on_menu_both_count, pattern=r"^mbc:"))
     app.add_handler(CallbackQueryHandler(on_mode_off, pattern=r"^mode:off$"))

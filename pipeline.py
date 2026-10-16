@@ -49,6 +49,7 @@ class DocumentTask:
     src_path: Path
     file_name: str
     lang: str
+    engine: str = "auto"  # motor elegido por el usuario (auto/google/microsoft/deepl)
     mode: str = "translate"  # "translate" | "split" | "both"
     split_spec: SplitSpec | None = None
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -302,9 +303,9 @@ async def process_job(task: DocumentTask, progress: ProgressCallback) -> JobResu
     store = get_store()
     upload_name = output_name_for(task.file_name, task.lang)
 
-    # Mismo documento + idioma + usuario: se reutiliza el resultado guardado.
+    # Mismo documento + idioma + usuario (+ motor): se reutiliza lo guardado.
     digest = await asyncio.to_thread(file_digest, task.src_path)
-    key = store.key_for(digest, task.lang, task.user_id)
+    key = store.key_for(digest, task.lang, task.user_id, task.engine)
     cached = store.cached_output(key)
     if cached is not None:
         logger.info("Resultado en caché para %s (%s)", task.file_name, key)
@@ -314,7 +315,7 @@ async def process_job(task: DocumentTask, progress: ProgressCallback) -> JobResu
     started = time.monotonic()
     stats: dict = {}
 
-    translator = create_translator(task.lang)
+    translator = create_translator(task.lang, engine=task.engine)
     async with translator:
         if suffix == ".pdf":
             stats = await translate_pdf(

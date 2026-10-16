@@ -45,11 +45,22 @@ class JobStore:
     # ------------------------------------------------------------------ claves
 
     @staticmethod
-    def key_for(digest: str, lang: str, user_id: int | None = None) -> str:
-        """Clave estable para un documento + idioma (+ usuario)."""
+    def key_for(
+        digest: str,
+        lang: str,
+        user_id: int | None = None,
+        engine: str | None = None,
+    ) -> str:
+        """Clave estable para un documento + idioma (+ usuario + motor elegido).
+
+        El motor forma parte de la clave: si el usuario cambia de motor, la
+        traducción se rehace con el nuevo en lugar de servir la anterior.
+        """
         key = f"{digest[:24]}-{lang}"
         if user_id is not None:
             key += f"-{user_id}"
+        if engine and engine != "auto":
+            key += f"-{engine}"
         return key
 
     def job_dir(self, key: str) -> Path:

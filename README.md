@@ -1,8 +1,10 @@
 # 🌍 Bot de Telegram para traducir documentos
 
 Bot de Telegram que recibe **PDF, EPUB, TXT o MD**, los traduce con
-**dos traductores web gratuitos (Google y Microsoft Edge/Bing, sin API key)** y
-los devuelve traducidos. También traduce mensajes de texto sueltos.
+**tres traductores web gratuitos (Google, Microsoft Edge/Bing y DeepL, sin API
+key)** y los devuelve traducidos. También traduce mensajes de texto sueltos.
+Cada usuario elige su **motor de traducción** (automático, solo Google, solo
+Microsoft o solo DeepL) con el botón **🧠 Motor** o el comando `/motor`.
 
 - **PDF** → conserva el diseño original: imágenes, tablas, colores, negritas y
   la posición del texto. La traducción se superpone exactamente donde estaba
@@ -18,17 +20,22 @@ los devuelve traducidos. También traduce mensajes de texto sueltos.
   recibes todas las secciones sin tocar y después cada una traducida. El tamaño
   de las secciones se elige con botones (**25 / 50 / 75 / 100 capítulos**), nada
   automático.
+- **🧠 Motor** → elige quién traduce: **Automático** (Google primero y, si se
+  bloquea, sigue Microsoft o DeepL), **solo Google**, **solo Microsoft** o
+  **solo DeepL**. También al vuelo desde la pregunta de cada archivo.
 - **Menú de botones fijo** → un teclado siempre visible (🌐 Traducir · ✂️
-  Dividir · 🔀 Dividir y traducir · ⚙️ Idioma · 📊 Estado · 🚫 Cancelar · ❓
-  Ayuda). Si envías un archivo sin haber elegido nada, el bot te pregunta qué
-  hacer con botones en vez de ponerse a traducir solo.
+  Dividir · 🔀 Dividir y traducir · ⚙️ Idioma · 🧠 Motor · 📊 Estado · 🚫
+  Cancelar · ❓ Ayuda). Si envías un archivo sin haber elegido nada, el bot te
+  pregunta qué hacer con botones en vez de ponerse a traducir solo.
 
 Pensado también para **novelas web de gran volumen (+1000 capítulos)**: traduce
-por lotes, **si Google limita la velocidad cambia solo a Microsoft** (cuota
-independiente) y el progreso muestra **con qué motor está traduciendo en ese
-momento**, muestra el avance también **dentro de cada capítulo**, guarda
-el progreso capítulo a capítulo, **reanuda** donde se quedó y puede **dividir la
-novela en secciones** para que un fallo solo cueste reenviar una parte.
+por lotes (el motor de Google nuevo admite **listas enteras de párrafos en una
+sola petición**), **si Google limita la velocidad cambia solo a Microsoft o
+DeepL** (cuotas independientes) y el progreso muestra **con qué motor está
+traduciendo en ese momento**, muestra el avance también **dentro de cada
+capítulo**, guarda el progreso capítulo a capítulo, **reanuda** donde se quedó y
+puede **dividir la novela en secciones** para que un fallo solo cueste reenviar
+una parte.
 
 ---
 
@@ -170,6 +177,8 @@ pie de foto del propio archivo (`/traducir`, `/dividir 25`, `/ambos`).
 | `/start`, `/help` | Ayuda y estado actual |
 | `/lang` | Teclado para elegir el idioma de destino |
 | `/lang en` | Cambia el idioma directamente (cualquier código de Google: `pt`, `fr`, `ja`, `zh`, `ar`…) |
+| `/motor` | Teclado para elegir el motor de traducción (automático, Google, Microsoft o DeepL) |
+| `/motor google` | Fija el motor: `auto`, `google`, `microsoft` o `deepl` |
 | `/traducir` | El próximo archivo se traduce tal cual |
 | `/dividir` | El próximo archivo se parte en secciones sin traducir |
 | `/dividir 25` | …en secciones de 25 capítulos (en PDF, 25 páginas) |
@@ -220,6 +229,32 @@ reproducible byte a byte: si una falla, reenvías el archivo original y solo se
 vuelve a traducir lo que faltaba (las partes ya hechas se recuperan al instante
 de la caché).
 
+### 🧠 Elegir el motor de traducción (`/motor`)
+
+Toca **🧠 Motor** (o escribe `/motor`) para elegir quién traduce. La elección
+es **por usuario** y se guarda en `users.json`, así que se aplica a tus
+próximas traducciones:
+
+- **🔄 Automático** (por defecto) — Google primero; si se bloquea (varios `429`
+  seguidos), el bot continúa con **Microsoft** (y con **DeepL** cuando el idioma
+  lo permite) para no dejar el libro a medias, y vuelve a probar Google más
+  tarde.
+- **🔵 Solo Google** — el más rápido y estable: usa el **método nuevo** de la
+  web de Google (`translate-pa`), que aguanta IPs de datacenter y traduce
+  **listas enteras de párrafos en una sola petición**.
+- **🟣 Solo Microsoft** — el traductor de Edge/Bing, sin cuotas compartidas con
+  Google.
+- **🟢 Solo DeepL** — la **mejor calidad** de traducción; va más despacio (una
+  petición a la vez, como su web) y solo aparece para los idiomas que DeepL
+  soporta (no se ofrece para latín, catalán, gallego ni euskera).
+
+También puedes cambiarlo justo antes de traducir: en la pregunta de cada
+archivo, el botón **🧠 Motor: …** abre el mismo selector y, al elegir, vuelve a
+la pregunta con el motor nuevo. El motor elegido aparece en el mensaje del
+archivo (`🧠 DeepL`), en el progreso mientras traduce (`⚙️ Google`) y en
+`/status` («🧠 Tu motor»). Las tareas ya en curso no cambian; el ajuste afecta a
+las siguientes.
+
 ---
 
 ## Novelas largas: qué tener en cuenta
@@ -240,11 +275,14 @@ de la caché).
   proveedores.
 - **Si Google bloquea el ritmo (`HTTP 429`)**: no tienes que hacer nada; el bot
   espacia las peticiones, cambia de endpoint, respeta la espera que pida Google
-  y, si aun así insiste, **pasa automáticamente al traductor de Microsoft**
-  (límites independientes) para que el libro siga avanzando; pasado un rato
-  vuelve a intentar Google. Desde un servidor (Render, VPS…) los límites de
-  Google son **más estrictos** que desde casa, así que si ves el aviso a menudo
-  sube `WEB_MIN_INTERVAL` a `1`-`1.5` y baja `TRANSLATE_CONCURRENCY` a `2`-`3`.
+  y, si aun así insiste, **pasa automáticamente al traductor de Microsoft** (o
+  a DeepL) para que el libro siga avanzando; pasado un rato vuelve a intentar
+  Google. El método nuevo de Google (`translate-pa`, el de su web actual) es
+  mucho más resistente desde datacenter que los endpoints clásicos, así que
+  normalmente ni verás el aviso. Desde un servidor (Render, VPS…) los límites
+  siguen siendo **más estrictos** que desde casa: si ves el aviso a menudo sube
+  `WEB_MIN_INTERVAL` a `1`-`1.5` y baja `TRANSLATE_CONCURRENCY` a `2`-`3`, o
+  prueba **🧠 Motor → Solo DeepL** para ese libro concreto.
 - **Volumen profesional**: si traduces muchas novelas al mes, activa el backend
   oficial (ver más abajo). Google Cloud Translation cuesta del orden de
   **20 $ por millón de caracteres** (los primeros 500.000 son gratis), así que
@@ -269,26 +307,38 @@ petición y sin límites agresivos.
 ## Cómo funciona
 
 - **Lotes de traducción**: en vez de una petición por párrafo (lo que
-  multiplicaría el tráfico en una novela), los párrafos cortos se unen con
-  saltos de línea y se traducen en un solo envío. Si Google devuelve un número
-  distinto de líneas, se reintenta ese lote párrafo a párrafo: nunca se pierde
-  texto.
+  multiplicaría el tráfico en una novela), los párrafos cortos se agrupan y se
+  traducen en un solo envío. Google lo hace de forma **nativa** (su método
+  nuevo acepta la lista completa de textos en una petición; con 100 párrafos
+  de golpe, sin problema) y DeepL también acepta listas. Si un motor devuelve
+  un número distinto de líneas, se reintenta ese lote párrafo a párrafo: nunca
+  se pierde texto.
 - **Freno y ritmo adaptativos**: las peticiones se espacian (por defecto 0,6 s
   entre cada una). Si un proveedor responde `429` o corta la conexión, el bot
   baja el ritmo, espera (incluida la cabecera `Retry-After`), rota al siguiente
   endpoint equivalente y reintenta con espera exponencial hasta 8 veces.
-- **Dos motores gratuitos con relevo automático** (modo `auto`, el de por
+- **Tres motores gratuitos con relevo automático** (modo `auto`, el de por
   defecto):
-  - **Google**: endpoints públicos que usa el propio traductor de Google en el
-    navegador (`client=gtx` sobre `translate.googleapis.com`, `clients5` y
-    `translate.google.com`; el último recurso usa `client=dict-chrome-ex`).
+  - **Google (método nuevo)**: los mismos endpoints que usa la web actual de
+    Google Translate y el plugin de Calibre «Ebook Translator»
+    (`translate-pa.googleapis.com/v1/translate` para textos sueltos y
+    `/v1/translateHtml` para lotes enteros). Si el método nuevo falla, el bot
+    vuelve temporalmente a los endpoints clásicos (`client=gtx` sobre
+    `translate.googleapis.com`, `clients5` y `translate.google.com`; el último
+    recurso usa `client=dict-chrome-ex`) mientras se recupera.
   - **Microsoft** (Edge/Bing): `edge.microsoft.com/translate/translatetext`,
     el mismo que usa el traductor de Microsoft en el navegador.
     No comparte cuota con Google: cuando Google encadena `429` (típico desde
     IP de datacenter como la de Render) el bot le da el turno en segundos,
     sigue traduciendo con Microsoft y vuelve a probar Google más tarde.
-  - Ninguno necesita API key ni cuenta. Si quieres fijar uno solo, usa
-    `TRANSLATOR_BACKEND=google` o `TRANSLATOR_BACKEND=microsoft`.
+  - **DeepL** gratuito: `oneshot-free.www.deepl.com/v1/storefront/translate`,
+    el traductor de su web (sin API key). Es el de **más calidad**, pero solo
+    se ofrece para los idiomas que DeepL soporta y va con pausa (una petición a
+    la vez). Si DeepL «devuelve el texto sin traducir» (su forma de limitar),
+    el bot lo detecta y el relevo continúa.
+  - Ninguno necesita API key ni cuenta. Si quieres fijar uno solo, usa el
+    botón **🧠 Motor** (por usuario) o `TRANSLATOR_BACKEND=google` /
+    `microsoft` / `deepl` (por defecto del servidor).
 - **PDF** (PyMuPDF): se extrae cada bloque de texto con su posición, tamaño,
   color y estilo; se traduce el bloque completo; se borra el texto original
   solo dentro de esa caja (respetando imágenes y gráficos) y se escribe la
@@ -313,7 +363,7 @@ petición y sin límites agresivos.
 ```
 bot.py              # capa de Telegram: menú de botones, comandos, cola y envío
 pipeline.py         # orquesta cada tarea, caché y reanudación
-translator.py       # traductores web gratuitos (Google + Microsoft) y relevo
+translator.py       # traductores web gratuitos (Google nuevo, Microsoft, DeepL) + relevo
 translator_api.py   # backend opcional con la API oficial de Google Cloud
 pdf_translate.py    # traducción de PDF conservando el diseño
 epub_translate.py   # traducción de EPUB conservando estructura y estilos
@@ -321,7 +371,7 @@ splitter.py         # detector de capítulos y divisor de novelas en secciones
 checkpoints.py      # progreso persistente por documento y caché de resultados
 health.py           # servidor HTTP de salud para Render (/health, /status)
 languages.py        # catálogo de idiomas
-users.py            # preferencias de idioma por usuario (users.json)
+users.py            # preferencias por usuario (idioma y motor) en users.json
 config.py           # variables de entorno y límites
 errors.py           # excepciones compartidas
 render.yaml         # despliegue en Render (Web Service gratuito o worker)
@@ -335,7 +385,7 @@ data/               # (se crea sola) trabajo, progreso y caché
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | — | Token de @BotFather (obligatorio) |
 | `DEFAULT_TARGET_LANG` | `es` | Idioma destino por defecto |
-| `TRANSLATOR_BACKEND` | `auto` | `auto` (Google + Microsoft de relevo), `google`/`web`, `microsoft`/`ms` o `api` (Google Cloud oficial) |
+| `TRANSLATOR_BACKEND` | `auto` | Motor por defecto del servidor: `auto` (Google + relevo Microsoft/DeepL), `google`/`web`, `microsoft`/`ms`, `deepl` o `api` (Google Cloud oficial). Cada usuario puede cambiarlo con 🧠 Motor |
 | `GOOGLE_API_KEY` | — | Clave de la API oficial (solo con `api`) |
 | `TRANSLATE_CONCURRENCY` | `6` | Peticiones simultáneas al traductor |
 | `WEB_MIN_INTERVAL` | `0.6` | Segundos mínimos entre peticiones web (desde Render usa `1`-`1.5`) |
@@ -361,11 +411,15 @@ python tests/selftest.py --real    # además, una traducción real con Google
 Las pruebas verifican: reemplazo real del texto (sin duplicarlo), conservación
 de imágenes/colores/negritas en PDF, conservación de enlaces, cursivas,
 `&nbsp;`, índices y metadatos en EPUB, detección de escaneos y DRM,
-cancelación, agrupación en lotes, reintentos tras bloqueos, reanudación de
-EPUB/PDF/TXT a medias, la caché de resultados, el divisor de novelas
-(capítulos, secciones válidas, sin pérdidas y reproducibles byte a byte), el
-menú fijo y los teclados de acción, el servidor de salud y la cola de trabajo
-completa (traducir, dividir y dividir-y-traducir) con un bot falso.
+cancelación, agrupación en lotes (incluido el **método nuevo de Google** con su
+lote nativo y el respaldo clásico), reintentos tras bloqueos, el relevo
+automático Google → Microsoft, **DeepL gratuito** (códigos de idioma y guarda
+anti-eco), la **selección de motor** (`auto`/`google`/`microsoft`/`deepl`), las
+preferencias por usuario, reanudación de EPUB/PDF/TXT a medias, la caché de
+resultados, el divisor de novelas (capítulos, secciones válidas, sin pérdidas y
+reproducibles byte a byte), el menú fijo y los teclados de acción (incluido el
+selector de motor), el servidor de salud y la cola de trabajo completa
+(traducir, dividir y dividir-y-traducir) con un bot falso.
 
 ## Limitaciones (importante)
 
@@ -380,13 +434,14 @@ completa (traducir, dividir y dividir-y-traducir) con un bot falso.
 - **Límite de velocidad**: los endpoints gratuitos pueden bloquear
   temporalmente si se hacen muchísimas peticiones seguidas; el bot se frena
   solo, cambia de endpoint y, si Google insiste, pasa al traductor de Microsoft
-  para no dejar el libro a medias. Si aun así falla te avisa para que lo
-  intentes más tarde.
+  (o a DeepL) para no dejar el libro a medias. Si aun así falla te avisa para
+  que lo intentes más tarde — o cambia de motor con 🧠 **Motor**.
 - **Disco efímero en hosting gratuito**: al reiniciar el servicio se pierden la
   caché y el progreso (no el libro original, que sigue en Telegram).
 
 ## Aviso de uso
 
-El endpoint web de Google es público y gratuito, pero no está pensado para
-grandes volúmenes: úsalo de forma razonable. Respeta los términos de servicio
-de Google y los derechos de autor de los documentos que traduzcas.
+Los endpoints web de Google, Microsoft y DeepL son públicos y gratuitos, pero
+no están pensados para grandes volúmenes: úsalos de forma razonable. Respeta
+los términos de servicio de cada proveedor y los derechos de autor de los
+documentos que traduzcas.

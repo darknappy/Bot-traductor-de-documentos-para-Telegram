@@ -47,9 +47,14 @@ from pipeline import DocumentTask, format_duration, safe_filename
 from splitter import SplitSpec, parse_split_command, split_document
 from translator import (
     AutoTranslator,
+    DeepLWebTranslator,
     GoogleWebTranslator,
     MicrosoftWebTranslator,
     TranslationError,
+    create_translator,
+    deepl_supported,
+    engine_label,
+    normalize_engine,
     split_text,
 )
 from translator_api import GoogleApiTranslator
@@ -781,7 +786,7 @@ async def test_web_batches() -> None:
     calls: list[str] = []
     transport = httpx.MockTransport(_google_handler(calls))
     texts = [f"Paragraph number {index} with enough words to translate." for index in range(10)]
-    async with GoogleWebTranslator("es", concurrency=2, transport=transport) as translator:
+    async with GoogleWebTranslator("es", concurrency=2, transport=transport, use_new=False) as translator:
         results = await translator.translate_many(texts)
 
     assert len(calls) == 1, f"se esperaba 1 petición, hubo {len(calls)}"
@@ -796,14 +801,14 @@ async def test_web_batches() -> None:
     # Muchos textos: varios lotes, todos correctos
     calls.clear()
     many = [f"Sentence {index} of the book that we are translating today." for index in range(200)]
-    async with GoogleWebTranslator("es", concurrency=4, transport=httpx.MockTransport(_google_handler(calls))) as translator:
+    async with GoogleWebTranslator("es", concurrency=4, transport=httpx.MockTransport(_google_handler(calls)), use_new=False) as translator:
         results = await translator.translate_many(many)
     assert 1 < len(calls) < 40, f"demasiadas peticiones: {len(calls)}"
     assert results == [f"[ES] {text.upper()}" for text in many]
 
     # Textos sin letras no se envían
     calls.clear()
-    async with GoogleWebTranslator("es", concurrency=2, transport=httpx.MockTransport(_google_handler(calls))) as translator:
+    async with GoogleWebTranslator("es", concurrency=2, transport=httpx.MockTransport(_google_handler(calls)), use_new=False) as translator:
         results = await translator.translate_many(["123 — 456", "!!! ??? ...", "Real text here."])
     assert results[0] == "123 — 456" and results[1] == "!!! ??? ..."
     assert results[2] == "[ES] REAL TEXT HERE."
@@ -816,14 +821,14 @@ async def test_web_fallback_and_cooldown() -> None:
     calls: list[str] = []
     transport = httpx.MockTransport(_google_handler(calls, merged=True))
     texts = ["First paragraph.", "Second paragraph.", "Third paragraph."]
-    async with GoogleWebTranslator("es", concurrency=2, transport=transport) as translator:
+    async with GoogleWebTranslator("es", concurrency=2, transport=transport, use_new=False) as translator:
         results = await translator.translate_many(texts)
     assert len(calls) == 4, f"1 lote fallido + 3 individuales, hubo {len(calls)}"
     assert results == ["[ES] FIRST PARAGRAPH.", "[ES] SECOND PARAGRAPH.", "[ES] THIRD PARAGRAPH."], results
 
     calls.clear()
     transport = httpx.MockTransport(_google_handler(calls, fails=2))
-    async with GoogleWebTranslator("es", concurrency=1, transport=transport) as translator:
+    async with GoogleWebTranslator("es", concurrency=1, transport=transport, use_new=False) as translator:
         translator.retry_delay_scale = 0.0  # no dormir en las pruebas
         result = await translator.translate("Hello world.")
         assert translator._cooldown_until > 0, "el freno global no se activó"
@@ -835,7 +840,7 @@ async def test_web_fallback_and_cooldown() -> None:
     calls.clear()
     transport = httpx.MockTransport(_google_handler(calls, fails=99))
     try:
-        async with GoogleWebTranslator("es", concurrency=1, transport=transport) as translator:
+        async with GoogleWebTranslator("es", concurrency=1, transport=transport, use_new=False) as translator:
             translator.retry_delay_scale = 0.0
             await translator.translate("Never translated.")
     except TranslationError:
@@ -882,7 +887,7 @@ async def test_web_endpoint_failover() -> None:
     calls: list[str] = []
     transport = httpx.MockTransport(_multi_host_handler(calls, blocked=frozenset({"translate.googleapis.com"})))
     async with GoogleWebTranslator(
-        "es", concurrency=2, transport=transport, min_interval=0.0, max_interval=0.0
+        "es", concurrency=2, transport=transport, min_interval=0.0, max_interval=0.0, use_new=False
     ) as translator:
         translator.retry_delay_scale = 0.0
         results = await translator.translate_many(["First paragraph.", "Second paragraph."])
@@ -895,7 +900,7 @@ async def test_web_endpoint_failover() -> None:
     calls.clear()
     transport = httpx.MockTransport(_multi_host_handler(calls))
     async with GoogleWebTranslator(
-        "es", concurrency=1, transport=transport, min_interval=0.0, max_interval=0.0
+        "es", concurrency=1, transport=transport, min_interval=0.0, max_interval=0.0, use_new=False
     ) as translator:
         translator._endpoint_index = 3
         results = await translator.translate_many(["Hello my friend", "Good night"])
@@ -911,7 +916,7 @@ async def test_web_rhythm() -> None:
     transport = httpx.MockTransport(_multi_host_handler(calls, fail_first=3))
     started = time.monotonic()
     async with GoogleWebTranslator(
-        "es", concurrency=1, transport=transport, min_interval=0.05, max_interval=0.5
+        "es", concurrency=1, transport=transport, min_interval=0.05, max_interval=0.5, use_new=False
     ) as translator:
         translator.retry_delay_scale = 0.0
         result = await translator.translate("Some text here.")
@@ -974,7 +979,7 @@ async def test_auto_failover() -> None:
     ms_calls: list[str] = []
     google = GoogleWebTranslator(
         "es", concurrency=1, transport=httpx.MockTransport(google_handler),
-        min_interval=0.0, max_interval=0.0,
+        min_interval=0.0, max_interval=0.0, use_new=False,
     )
     google.retry_delay_scale = 0.0
     google.max_attempts = 4
@@ -1018,7 +1023,7 @@ async def test_auto_failover() -> None:
     broken.max_attempts = 2
     google2 = GoogleWebTranslator(
         "es", concurrency=1, transport=httpx.MockTransport(google_handler),
-        min_interval=0.0, max_interval=0.0,
+        min_interval=0.0, max_interval=0.0, use_new=False,
     )
     google2.retry_delay_scale = 0.0
     google2.max_attempts = 2
@@ -1030,6 +1035,232 @@ async def test_auto_failover() -> None:
     else:
         raise AssertionError("con los dos proveedores caídos debería lanzar TranslationError")
     print("OK · relevo automático Google → Microsoft (y error claro si fallan ambos)")
+
+
+def _google_new_handler(calls: list[str], *, fails: int = 0):
+    """Simula el método nuevo de Google (translate-pa): lote POST y texto GET."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if len(calls) <= fails:
+            return httpx.Response(429, text="too many requests", headers={"content-type": "text/plain"})
+        if request.url.path.endswith("/translateHtml"):
+            body = json.loads(request.content.decode("utf-8"))
+            texts = body[0][0]
+            assert body[0][1] == "auto" and body[0][2] == "es", body[0]
+            assert body[1] == "wt_lib", body
+            assert request.headers.get("x-goog-api-key"), "falta la clave del lote"
+            translations = [f"[ES] {text.upper()}" for text in texts]
+            return httpx.Response(200, json=[translations, ["en"] * len(texts)])
+        text = request.url.params.get("query.text", "")
+        return httpx.Response(200, json={"translation": f"[ES] {text.upper()}", "sourceLanguage": "en"})
+
+    return handler
+
+
+async def test_google_new_method() -> None:
+    """El método nuevo de Google: lote entero, textos sueltos y respaldo clásico."""
+    calls: list[str] = []
+    transport = httpx.MockTransport(_google_new_handler(calls))
+    texts = [f"Paragraph {index} with enough words to translate." for index in range(30)]
+    async with GoogleWebTranslator("es", concurrency=4, transport=transport) as translator:
+        results = await translator.translate_many(texts)
+        assert translator.detected_lang == "en", translator.detected_lang
+    assert len(calls) == 1, f"el lote entero debería viajar en 1 petición: {len(calls)}"
+    assert results == [f"[ES] {text.upper()}" for text in texts], results
+
+    # Los textos multilínea también van en el lote nativo (sin unirlos con \n)
+    calls.clear()
+    async with GoogleWebTranslator("es", concurrency=2, transport=transport) as translator:
+        results = await translator.translate_many(["Line one\nLine two", "Solo line."])
+    assert results == ["[ES] LINE ONE\nLINE TWO", "[ES] SOLO LINE."], results
+    assert len(calls) == 1, calls
+
+    # Texto suelto: usa /v1/translate (GET)
+    calls.clear()
+    async with GoogleWebTranslator("es", concurrency=1, transport=transport) as translator:
+        result = await translator.translate("Hello world, this is a test.")
+    assert result == "[ES] HELLO WORLD, THIS IS A TEST."
+    assert calls and calls[0].startswith("https://translate-pa.googleapis.com/v1/translate"), calls
+
+    # Si el método nuevo falla, se cae al clásico y se reintenta más tarde
+    classic_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "translate-pa.googleapis.com":
+            return httpx.Response(500, text="boom", headers={"content-type": "text/plain"})
+        return _google_handler(classic_calls)(request)
+
+    async with GoogleWebTranslator("es", concurrency=2, transport=httpx.MockTransport(handler)) as translator:
+        results = await translator.translate_many(["First paragraph.", "Second paragraph."])
+        assert results == ["[ES] FIRST PARAGRAPH.", "[ES] SECOND PARAGRAPH."], results
+        assert classic_calls, "debería usar el método clásico de respaldo"
+        assert translator._new_fails >= 1 and not translator._new_available()
+    print("OK · método nuevo de Google (lote nativo + respaldo clásico)")
+
+
+def _deepl_handler(calls: list[dict], *, echo: bool = False, fails: int = 0):
+    """Simula el DeepL gratuito (storefront): lote de textos y respuesta «eco»."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "oneshot-free.www.deepl.com", str(request.url)
+        body = json.loads(request.content.decode("utf-8"))
+        calls.append(body)
+        if len(calls) <= fails:
+            return httpx.Response(429, text="too many requests")
+        texts = body["text"]
+        translated = [text if echo else f"[ES] {text.upper()}" for text in texts]
+        payload = {
+            "translations": [
+                {"detected_source_language": "en", "text": item} for item in translated
+            ]
+        }
+        return httpx.Response(200, json=payload)
+
+    return handler
+
+
+async def test_deepl_free_translator() -> None:
+    """DeepL gratuito: lotes, códigos de idioma y guarda contra la respuesta «eco»."""
+    calls: list[dict] = []
+    transport = httpx.MockTransport(_deepl_handler(calls))
+    async with DeepLWebTranslator("es", transport=transport, min_interval=0.0, max_interval=0.0) as translator:
+        results = await translator.translate_many(
+            ["First sentence of the page.", "Second sentence here.", "Third one there."]
+        )
+        assert translator.detected_lang == "en"
+    assert results == [
+        "[ES] FIRST SENTENCE OF THE PAGE.",
+        "[ES] SECOND SENTENCE HERE.",
+        "[ES] THIRD ONE THERE.",
+    ], results
+    assert len(calls) == 1, "los párrafos deberían viajar en un lote"
+    assert calls[0]["target_lang"] == "es-ES", calls[0]["target_lang"]
+    assert calls[0]["source_lang"] == "auto"
+    assert calls[0]["language_model"] == "next-gen"
+    assert calls[0]["app_information"]["instance_id"]
+
+    assert DeepLWebTranslator("pt", transport=transport).deepl_target == "pt"
+    assert DeepLWebTranslator("zh", transport=transport).deepl_target == "zh-Hans"
+    assert DeepLWebTranslator("no", transport=transport).deepl_target == "nb"
+    try:
+        DeepLWebTranslator("la")
+    except TranslationError:
+        pass
+    else:
+        raise AssertionError("DeepL no debería aceptar idiomas fuera de la tabla")
+
+    # Respuesta «eco» (DeepL devuelve el texto original): se trata como fallo
+    echo_calls: list[dict] = []
+    echo = DeepLWebTranslator(
+        "es", transport=httpx.MockTransport(_deepl_handler(echo_calls, echo=True)),
+        min_interval=0.0, max_interval=0.0,
+    )
+    echo.max_attempts = 1
+    echo.retry_delay_scale = 0.0
+    async with echo:
+        try:
+            await echo.translate_many(
+                ["This paragraph is long enough to notice it was not translated at all, really."]
+            )
+        except TranslationError as err:
+            assert "sin traducir" in str(err), err
+        else:
+            raise AssertionError("el eco de DeepL debería lanzar TranslationError")
+    print("OK · DeepL gratuito (lotes, códigos y guarda anti-eco)")
+
+
+def test_engine_selection() -> None:
+    """La fábrica respeta el motor elegido (auto/google/microsoft/deepl/api)."""
+    import config
+
+    assert normalize_engine("auto") == "auto"
+    assert normalize_engine("Automatic") == "auto"
+    assert normalize_engine("web") == "google"
+    assert normalize_engine("edge") == "microsoft"
+    assert normalize_engine("ms") == "microsoft"
+    assert normalize_engine("DeepL") == "deepl"
+    assert normalize_engine("deepl-web") == "deepl"
+    assert normalize_engine("gcp") == "api"
+    assert normalize_engine("nope") is None
+    assert engine_label("deepl") == "DeepL"
+    assert engine_label(None) == "Automático"
+
+    assert deepl_supported("es") and deepl_supported("pt-BR") and deepl_supported("zh")
+    assert not deepl_supported("la") and not deepl_supported("ca")
+
+    original_backend = config.TRANSLATOR_BACKEND
+    original_key = config.GOOGLE_API_KEY
+    try:
+        config.TRANSLATOR_BACKEND = "auto"
+        config.GOOGLE_API_KEY = ""
+        auto = create_translator("es")
+        assert isinstance(auto, AutoTranslator)
+        assert [t.name for t in auto._translators] == ["google-web", "microsoft-web", "deepl-web"]
+        auto_la = create_translator("la")
+        assert [t.name for t in auto_la._translators] == ["google-web", "microsoft-web"]
+
+        google = create_translator("es", engine="google")
+        assert isinstance(google, GoogleWebTranslator) and not isinstance(google, AutoTranslator)
+        assert google.supports_native_batch
+        assert isinstance(create_translator("es", engine="microsoft"), MicrosoftWebTranslator)
+        deepl = create_translator("es", engine="deepl")
+        assert isinstance(deepl, DeepLWebTranslator) and deepl.deepl_target == "es-ES"
+
+        # DeepL no soporta el idioma pedido: aviso y modo automático
+        assert isinstance(create_translator("la", engine="deepl"), AutoTranslator)
+
+        # El motor del usuario manda sobre TRANSLATOR_BACKEND
+        config.TRANSLATOR_BACKEND = "web"
+        assert isinstance(create_translator("es"), GoogleWebTranslator)
+        assert isinstance(create_translator("es", engine="deepl"), DeepLWebTranslator)
+        assert isinstance(create_translator("es", engine="auto"), AutoTranslator)
+        config.TRANSLATOR_BACKEND = "api"  # sin clave: cae a los gratuitos
+        assert isinstance(create_translator("es"), AutoTranslator)
+    finally:
+        config.TRANSLATOR_BACKEND = original_backend
+        config.GOOGLE_API_KEY = original_key
+    print("OK · selección de motor (auto/google/microsoft/deepl/api)")
+
+
+def test_users_preferences() -> None:
+    """Los usuarios guardan idioma y motor; se acepta el formato antiguo."""
+    import config
+    import users as users_module
+
+    original = config.USERS_FILE
+    original_cache = users_module._cache
+    path = WORK / "users_test.json"
+    try:
+        path.write_text(
+            json.dumps({"7": "en", "8": {"lang": "fr", "engine": "deepl"}}), "utf-8"
+        )
+        config.USERS_FILE = path
+        users_module._cache = None
+        assert users_module.get_lang(7) == "en"          # formato antiguo
+        assert users_module.get_engine(7) == "auto"      # sin motor: automático
+        assert users_module.get_lang(8) == "fr"
+        assert users_module.get_engine(8) == "deepl"
+
+        users_module.set_engine(7, "google")
+        users_module.set_lang(8, "es")
+        users_module._cache = None
+        assert users_module.get_engine(7) == "google"
+        assert users_module.get_lang(8) == "es"
+        saved = json.loads(path.read_text("utf-8"))
+        assert saved["7"] == {"lang": "en", "engine": "google"}, saved
+        assert saved["8"] == {"lang": "es", "engine": "deepl"}, saved
+
+        users_module.set_engine(7, "auto")
+        users_module._cache = None
+        assert users_module.get_engine(7) == "auto"
+        saved = json.loads(path.read_text("utf-8"))
+        assert "engine" not in saved["7"], saved["7"]
+    finally:
+        config.USERS_FILE = original
+        users_module._cache = original_cache
+        path.unlink(missing_ok=True)
+    print("OK · preferencias por usuario (idioma y motor)")
 
 
 async def test_epub_progress_units() -> None:
@@ -1197,7 +1428,7 @@ def test_build_app() -> None:
         for command in handler.commands
     }
     assert {
-        "start", "help", "lang", "traducir", "dividir", "ambos", "status", "cancel"
+        "start", "help", "lang", "motor", "traducir", "dividir", "ambos", "status", "cancel"
     } <= commands, commands
     assert any(isinstance(handler, MessageHandler) for handler in handlers)
     assert sum(isinstance(handler, CallbackQueryHandler) for handler in handlers) >= 4
@@ -1227,10 +1458,37 @@ def test_ui_helpers() -> None:
 
     markup = bot_module._file_action_keyboard("tok12345")
     datas = [b.callback_data for row in markup.inline_keyboard for b in row]
-    assert datas == ["fx:tok12345:t", "fx:tok12345:d", "fx:tok12345:b", "fx:tok12345:x"], datas
+    assert datas == [
+        "fx:tok12345:t",
+        "fx:tok12345:d",
+        "fx:tok12345:b",
+        "fx:tok12345:e",
+        "fx:tok12345:x",
+    ], datas
     assert any(b.api_kwargs for row in markup.inline_keyboard for b in row), "faltan los colores"
     plain = bot_module._plain_markup(markup)
     assert all(not b.api_kwargs for row in plain.inline_keyboard for b in row)
+
+    # Selector de motor (🧠 Motor): Automático, Google, Microsoft y DeepL
+    engine_kb = bot_module._engine_markup("auto", lang="es")
+    datas = [b.callback_data for row in engine_kb.inline_keyboard for b in row]
+    assert datas == ["eng:auto", "eng:google", "eng:microsoft", "eng:deepl"], datas
+    assert "✅" in engine_kb.inline_keyboard[0][0].text
+    latin_kb = bot_module._engine_markup("google", lang="la")
+    datas = [b.callback_data for row in latin_kb.inline_keyboard for b in row]
+    assert "eng:deepl" not in datas, "DeepL no traduce latín: no debe ofrecerse"
+    file_kb = bot_module._engine_markup("deepl", token="tok12345", lang="es")
+    datas = [b.callback_data for row in file_kb.inline_keyboard for b in row]
+    assert datas == [
+        "fe:tok12345:auto",
+        "fe:tok12345:google",
+        "fe:tok12345:microsoft",
+        "fe:tok12345:deepl",
+        "fx:tok12345:v",
+    ], datas
+    assert "✅" in file_kb.inline_keyboard[3][0].text
+    assert "Motor de traducción" in bot_module._engine_menu_text("auto", "es")
+    assert "DeepL" in bot_module._file_question_text("libro.epub", 2048, "es", "deepl")
 
     # Selector de capítulos por sección de «dividir y traducir»
     chapters = bot_module._chapters_markup("tok12345")
@@ -1247,12 +1505,14 @@ def test_ui_helpers() -> None:
     assert datas == ["mbc:25", "mbc:50", "mbc:75", "mbc:100"], datas
     assert "capítulos por sección" in bot_module._chapters_text("novela.epub")
 
-    # Indicador del motor que está traduciendo (Google / Microsoft)
+    # Indicador del motor que está traduciendo (Google / Microsoft / DeepL)
     import translator as translator_module
 
     translator_module.record_engine("microsoft-web")
     assert translator_module.active_engine() == ("microsoft-web", "Microsoft")
     assert translator_module.active_engine(max_age=-1.0) is None, "el motor debe caducar"
+    translator_module.record_engine("deepl-web")
+    assert translator_module.active_engine() == ("deepl-web", "DeepL")
     translator_module.record_engine("google-web")
     assert translator_module.active_engine() == ("google-web", "Google")
 
@@ -1477,13 +1737,17 @@ async def main() -> None:
         test_utilidades()
         test_build_app()
         test_ui_helpers()
+        test_engine_selection()
+        test_users_preferences()
         await test_health_server()
         await test_job_store()
         await test_web_batches()
         await test_web_fallback_and_cooldown()
         await test_web_endpoint_failover()
         await test_web_rhythm()
+        await test_google_new_method()
         await test_microsoft_translator()
+        await test_deepl_free_translator()
         await test_auto_failover()
         await test_api_translator()
         await test_pdf_mock()
