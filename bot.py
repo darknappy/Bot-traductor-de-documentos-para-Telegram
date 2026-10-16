@@ -1,4 +1,4 @@
-"""Bot de Telegram que traduce documentos (PDF, EPUB, TXT, MD) con Google web.
+"""Bot de Telegram que traduce documentos (PDF, EPUB, TXT, MD) con Google y Microsoft.
 
 Uso:
     1. Copia .env.example a .env y pega el token de @BotFather.
@@ -34,7 +34,7 @@ import users
 from errors import JobCancelledError, ScannedPdfError, UnsupportedFormatError
 from health import start_health_server
 from pipeline import DocumentTask, format_duration, get_store, process_job, safe_filename
-from translator import GoogleWebTranslator, TranslationError
+from translator import TranslationError, create_translator
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -98,7 +98,8 @@ def _status_snapshot() -> dict:
 def help_text(lang: str) -> str:
     return (
         "🌍 <b>Bot traductor de documentos</b>\n\n"
-        "Envíame un archivo y te lo devuelvo traducido con Google Translate:\n"
+        "Envíame un archivo y te lo devuelvo traducido con los traductores gratuitos\n"
+        "de Google y Microsoft:\n"
         "• <b>PDF</b> — conserva el diseño original (imágenes, tablas, colores)\n"
         "• <b>EPUB</b> — conserva capítulos, estilos, enlaces e imágenes\n"
         "• <b>TXT / MD</b> — texto plano\n\n"
@@ -385,11 +386,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lang = users.get_lang(update.effective_user.id)
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     try:
-        async with GoogleWebTranslator(lang, concurrency=2) as translator:
+        async with create_translator(lang, concurrency=2) as translator:
             translated = await translator.translate(text)
     except TranslationError as err:
         await message.reply_text(
-            f"❌ El traductor de Google falló: {html.escape(str(err))}\nInténtalo de nuevo más tarde."
+            f"❌ Fallaron los traductores gratuitos (Google y Microsoft): {html.escape(str(err))}\n"
+            "Puede ser un bloqueo temporal por exceso de peticiones; inténtalo de nuevo en unos minutos."
         )
         return
     for start in range(0, max(1, len(translated)), 3800):
@@ -506,8 +508,8 @@ async def _worker(app: Application) -> None:
             await _safe_edit(
                 bot,
                 task,
-                f"❌ El traductor de Google falló: {html.escape(str(err))}\n"
-                "Suele ser un bloqueo temporal por exceso de peticiones; inténtalo de nuevo más tarde.",
+                f"❌ Fallaron los traductores gratuitos (Google y Microsoft): {html.escape(str(err))}\n"
+                "Puede ser un bloqueo temporal por exceso de peticiones; vuelve a intentarlo más tarde.",
             )
         except Exception:  # noqa: BLE001
             logger.exception("Fallo procesando la tarea %s", task.task_id)

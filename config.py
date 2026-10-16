@@ -40,9 +40,12 @@ TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 # Idioma destino por defecto (código de Google: "es", "en", "pt"...).
 DEFAULT_TARGET_LANG: str = (os.getenv("DEFAULT_TARGET_LANG", "es") or "es").strip().lower()
 
-# Motor de traducción: "web" (gratis, sin API key) o "api" (Google Cloud
-# Translation, requiere GOOGLE_API_KEY y facturación).
-TRANSLATOR_BACKEND: str = (os.getenv("TRANSLATOR_BACKEND", "web") or "web").strip().lower()
+# Motor de traducción:
+#   "auto" (por defecto) → Google gratis y, si se bloquea, Microsoft de relevo.
+#   "web"/"google"       → solo el endpoint web gratuito de Google.
+#   "ms"/"microsoft"     → solo el traductor gratuito de Microsoft (Edge/Bing).
+#   "api"                → Google Cloud Translation (necesita GOOGLE_API_KEY).
+TRANSLATOR_BACKEND: str = (os.getenv("TRANSLATOR_BACKEND", "auto") or "auto").strip().lower()
 GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "").strip()
 
 # Peticiones simultáneas al traductor.

@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 ProgressFn = Callable[[float, str], Awaitable[None]]
+UnitsFn = Callable[[int, int], Awaitable[None]]
 CancelFn = Callable[[], bool]
 
 # Elementos cuyo contenido textual se traduce como una unidad.
@@ -237,14 +238,21 @@ def _plan_tasks(soup: BeautifulSoup) -> list[tuple[str, object, str]]:
     return tasks
 
 
-async def _translate_batched(translator, texts: list[str]) -> list[str]:
+async def _translate_batched(
+    translator, texts: list[str], on_progress: UnitsFn | None = None
+) -> list[str]:
     results: list[str] = []
-    for start in range(0, len(texts), _BATCH):
+    total = len(texts)
+    for start in range(0, total, _BATCH):
         results.extend(await translator.translate_many(texts[start:start + _BATCH]))
+        if on_progress is not None:
+            await on_progress(min(start + _BATCH, total), total)
     return results
 
 
-async def _render_translated(content: bytes, translator) -> tuple[bytes, int]:
+async def _render_translated(
+    content: bytes, translator, on_progress: UnitsFn | None = None
+) -> tuple[bytes, int]:
     """Devuelve el documento con los textos traducidos y el número de fragmentos."""
     text = _decode(content)
     _xml_decl, doctype, body = _split_prefix(text)
@@ -255,7 +263,9 @@ async def _render_translated(content: bytes, translator) -> tuple[bytes, int]:
     if not tasks:
         return content, 0
 
-    results = await _translate_batched(translator, [task[2] for task in tasks])
+    if on_progress is not None:
+        await on_progress(0, len(tasks))
+    results = await _translate_batched(translator, [task[2] for task in tasks], on_progress)
     for (kind, target, _original), translated in zip(tasks, results):
         if not translated or not translated.strip():
             continue
@@ -415,7 +425,19 @@ async def translate_epub(
                 raw = zin.read(name)
             except KeyError:  # pragma: no cover - entradas raras del zip
                 continue
-            new_content, units = await _render_translated(raw, translator)
+
+            async def report_units(done_units: int, total_units: int) -> None:
+                # Progreso dentro del documento: así la barra se mueve y se ve
+                # que el libro avanza aunque un capítulo tarde varios minutos.
+                if progress is None or total_units <= 0:
+                    return
+                await progress(
+                    (index + done_units / total_units) / total,
+                    f"documento {index + 1}/{len(content_names)} · fragmento "
+                    f"{done_units}/{total_units}",
+                )
+
+            new_content, units = await _render_translated(raw, translator, report_units)
             if units:
                 if store is not None and key:
                     store.write_blob(key, index, new_content)

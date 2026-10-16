@@ -1,8 +1,8 @@
 # 🌍 Bot de Telegram para traducir documentos
 
-Bot de Telegram que recibe **PDF, EPUB, TXT o MD**, los traduce con el
-**traductor web de Google (gratuito, sin API key)** y los devuelve traducidos.
-También traduce mensajes de texto sueltos.
+Bot de Telegram que recibe **PDF, EPUB, TXT o MD**, los traduce con
+**dos traductores web gratuitos (Google y Microsoft Edge/Bing, sin API key)** y
+los devuelve traducidos. También traduce mensajes de texto sueltos.
 
 - **PDF** → conserva el diseño original: imágenes, tablas, colores, negritas y
   la posición del texto. La traducción se superpone exactamente donde estaba
@@ -13,8 +13,9 @@ También traduce mensajes de texto sueltos.
 - **TXT / MD** → texto plano traducido línea a línea.
 
 Pensado también para **novelas web de gran volumen (+1000 capítulos)**: traduce
-por lotes, se frena solo si Google limita la velocidad, guarda el progreso
-capítulo a capítulo y **reanuda** donde se quedó.
+por lotes, **si Google limita la velocidad cambia solo a Microsoft** (cuota
+independiente), muestra el progreso también **dentro de cada capítulo**, guarda
+el progreso capítulo a capítulo y **reanuda** donde se quedó.
 
 ---
 
@@ -165,14 +166,17 @@ También puedes escribirle un texto normal y te lo traduce al momento.
 - **Caché**: cuando un documento termina, el resultado se guarda (7 días o
   512 MB por defecto). Si vuelves a enviar el mismo archivo, te lo devuelve
   **al instante** sin traducir nada.
-- **Velocidad**: con el endpoint web gratuito una novela de 1500 capítulos
+- **Velocidad**: con los endpoints web gratuitos una novela de 1500 capítulos
   (unas 4.000–8.000 peticiones agrupadas) tarda aproximadamente **entre 20
-  minutos y 2 horas**, según el tamaño y las pausas por límite de Google.
+  minutos y 2 horas**, según el tamaño y las pausas por límite de los
+  proveedores.
 - **Si Google bloquea el ritmo (`HTTP 429`)**: no tienes que hacer nada; el bot
   espacia las peticiones, cambia de endpoint, respeta la espera que pida Google
-  y reintenta solo. Desde un servidor (Render, VPS…) los límites son **más
-  estrictos** que desde casa, así que si ves el aviso a menudo sube
-  `WEB_MIN_INTERVAL` a `1`-`1.5` y baja `TRANSLATE_CONCURRENCY` a `2`-`3`.
+  y, si aun así insiste, **pasa automáticamente al traductor de Microsoft**
+  (límites independientes) para que el libro siga avanzando; pasado un rato
+  vuelve a intentar Google. Desde un servidor (Render, VPS…) los límites de
+  Google son **más estrictos** que desde casa, así que si ves el aviso a menudo
+  sube `WEB_MIN_INTERVAL` a `1`-`1.5` y baja `TRANSLATE_CONCURRENCY` a `2`-`3`.
 - **Volumen profesional**: si traduces muchas novelas al mes, activa el backend
   oficial (ver más abajo). Google Cloud Translation cuesta del orden de
   **20 $ por millón de caracteres** (los primeros 500.000 son gratis), así que
@@ -202,13 +206,21 @@ petición y sin límites agresivos.
   distinto de líneas, se reintenta ese lote párrafo a párrafo: nunca se pierde
   texto.
 - **Freno y ritmo adaptativos**: las peticiones se espacian (por defecto 0,6 s
-  entre cada una). Si Google responde `429` o corta la conexión, el bot baja el
-  ritmo, espera (incluida la cabecera `Retry-After`), rota al siguiente endpoint
-  equivalente y reintenta con espera exponencial hasta 8 veces.
-- **Motor gratuito**: endpoints públicos que usa el propio traductor de Google
-  en el navegador (`client=gtx` sobre `translate.googleapis.com`, `clients5` y
-  `translate.google.com`; el último recurso usa `client=dict-chrome-ex`). No
-  necesita API key ni cuenta.
+  entre cada una). Si un proveedor responde `429` o corta la conexión, el bot
+  baja el ritmo, espera (incluida la cabecera `Retry-After`), rota al siguiente
+  endpoint equivalente y reintenta con espera exponencial hasta 8 veces.
+- **Dos motores gratuitos con relevo automático** (modo `auto`, el de por
+  defecto):
+  - **Google**: endpoints públicos que usa el propio traductor de Google en el
+    navegador (`client=gtx` sobre `translate.googleapis.com`, `clients5` y
+    `translate.google.com`; el último recurso usa `client=dict-chrome-ex`).
+  - **Microsoft** (Edge/Bing): `edge.microsoft.com/translate/translatetext`,
+    el mismo que usa el traductor de Microsoft en el navegador.
+    No comparte cuota con Google: cuando Google encadena `429` (típico desde
+    IP de datacenter como la de Render) el bot le da el turno en segundos,
+    sigue traduciendo con Microsoft y vuelve a probar Google más tarde.
+  - Ninguno necesita API key ni cuenta. Si quieres fijar uno solo, usa
+    `TRANSLATOR_BACKEND=google` o `TRANSLATOR_BACKEND=microsoft`.
 - **PDF** (PyMuPDF): se extrae cada bloque de texto con su posición, tamaño,
   color y estilo; se traduce el bloque completo; se borra el texto original
   solo dentro de esa caja (respetando imágenes y gráficos) y se escribe la
@@ -217,7 +229,9 @@ petición y sin límites agresivos.
 - **EPUB** (BeautifulSoup + lxml): el libro se trata como ZIP. Los bloques de
   texto se traducen como unidad y los que contienen enlaces o imágenes se
   traducen nodo a nodo para no perder estructura. Se actualiza `dc:language` y
-  el título lleva el sufijo del idioma.
+  el título lleva el sufijo del idioma. El progreso avanza **documento a
+  documento y fragmento a fragmento**, así que la barra se mueve aunque un
+  capítulo tarde varios minutos.
 - **Cola de trabajo**: las tareas se procesan en cola (1 a la vez por defecto)
   para no saturar el traductor; varios usuarios pueden enviar documentos.
 
@@ -226,7 +240,7 @@ petición y sin límites agresivos.
 ```
 bot.py              # capa de Telegram: comandos, cola de trabajo, envío
 pipeline.py         # orquesta cada tarea, caché y reanudación
-translator.py       # traductor web de Google (lotes, freno, reintentos)
+translator.py       # traductores web gratuitos (Google + Microsoft) y relevo
 translator_api.py   # backend opcional con la API oficial de Google Cloud
 pdf_translate.py    # traducción de PDF conservando el diseño
 epub_translate.py   # traducción de EPUB conservando estructura y estilos
@@ -247,11 +261,11 @@ data/               # (se crea sola) trabajo, progreso y caché
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | — | Token de @BotFather (obligatorio) |
 | `DEFAULT_TARGET_LANG` | `es` | Idioma destino por defecto |
-| `TRANSLATOR_BACKEND` | `web` | `web` (gratis) o `api` (Google Cloud oficial) |
+| `TRANSLATOR_BACKEND` | `auto` | `auto` (Google + Microsoft de relevo), `google`/`web`, `microsoft`/`ms` o `api` (Google Cloud oficial) |
 | `GOOGLE_API_KEY` | — | Clave de la API oficial (solo con `api`) |
 | `TRANSLATE_CONCURRENCY` | `6` | Peticiones simultáneas al traductor |
 | `WEB_MIN_INTERVAL` | `0.6` | Segundos mínimos entre peticiones web (desde Render usa `1`-`1.5`) |
-| `WEB_MAX_INTERVAL` | `8` | Ritmo más lento al que se frena si Google limita (`429`) |
+| `WEB_MAX_INTERVAL` | `8` | Ritmo más lento al que se frena si un proveedor limita (`429`) |
 | `MAX_CONCURRENT_JOBS` | `1` | Documentos traducidos a la vez |
 | `MAX_INPUT_MB` | `20` | Tamaño máximo de entrada |
 | `MAX_OUTPUT_MB` | `48` | Tamaño máximo de salida |
@@ -284,9 +298,11 @@ de trabajo completa con un bot falso.
 - **Idiomas de destino RTL en PDF** (árabe, hebreo): el texto se inserta, pero
   la disposición de derecha a izquierda puede no ser perfecta. En EPUB funciona
   bien.
-- **Límite de velocidad**: el endpoint gratuito de Google puede bloquear
+- **Límite de velocidad**: los endpoints gratuitos pueden bloquear
   temporalmente si se hacen muchísimas peticiones seguidas; el bot se frena
-  solo y reintenta, y si aun así falla te avisa para que lo intentes más tarde.
+  solo, cambia de endpoint y, si Google insiste, pasa al traductor de Microsoft
+  para no dejar el libro a medias. Si aun así falla te avisa para que lo
+  intentes más tarde.
 - **Disco efímero en hosting gratuito**: al reiniciar el servicio se pierden la
   caché y el progreso (no el libro original, que sigue en Telegram).
 

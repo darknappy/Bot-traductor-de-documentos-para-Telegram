@@ -43,7 +43,13 @@ from errors import JobCancelledError, ScannedPdfError, UnsupportedFormatError
 from health import start_health_server
 from pdf_translate import translate_pdf
 from pipeline import DocumentTask, format_duration, safe_filename
-from translator import GoogleWebTranslator, TranslationError, split_text
+from translator import (
+    AutoTranslator,
+    GoogleWebTranslator,
+    MicrosoftWebTranslator,
+    TranslationError,
+    split_text,
+)
 from translator_api import GoogleApiTranslator
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -654,6 +660,123 @@ async def test_web_rhythm() -> None:
     print(f"OK · ritmo adaptativo (frenó a {translator._interval:.2f} s y respetó Retry-After)")
 
 
+def _microsoft_handler(calls: list[str]):
+    """Simula el traductor gratuito de Microsoft (edge.microsoft.com)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "edge.microsoft.com" in request.url.host, str(request.url)
+        assert request.url.params.get("to") == "es", str(request.url)
+        body = json.loads(request.content.decode("utf-8"))
+        text = body[0]
+        calls.append(text)
+        lines = [line for line in text.split("\n") if line.strip()]
+        translated = "\n".join(f"[ES] {line.upper()}" for line in lines)
+        payload = [
+            {
+                "detectedLanguage": {"language": "en", "score": 1.0},
+                "translations": [{"text": translated, "to": "es"}],
+            }
+        ]
+        # El endpoint real sirve el JSON con "text/plain" (comprobado en vivo).
+        return httpx.Response(200, json=payload, headers={"content-type": "text/plain; charset=utf-8"})
+
+    return handler
+
+
+async def test_microsoft_translator() -> None:
+    """El traductor gratuito de Microsoft (Edge/Bing) traduce lotes y detecta idioma."""
+    calls: list[str] = []
+    transport = httpx.MockTransport(_microsoft_handler(calls))
+    async with MicrosoftWebTranslator("es", concurrency=2, transport=transport) as translator:
+        results = await translator.translate_many(
+            ["First paragraph.", "Second paragraph.", "Third paragraph."]
+        )
+    assert results == ["[ES] FIRST PARAGRAPH.", "[ES] SECOND PARAGRAPH.", "[ES] THIRD PARAGRAPH."], results
+    assert len(calls) == 1, f"los tres textos deberían ir en un lote: {calls}"
+    assert translator.detected_lang == "en", translator.detected_lang
+    print("OK · traductor gratuito de Microsoft (lotes y detección de idioma)")
+
+
+async def test_auto_failover() -> None:
+    """Si Google encadena 429, Microsoft toma el relevo automáticamente."""
+    google_calls: list[str] = []
+
+    def google_handler(request: httpx.Request) -> httpx.Response:
+        google_calls.append(str(request.url))
+        return httpx.Response(429, text="too many requests", headers={"content-type": "text/plain"})
+
+    ms_calls: list[str] = []
+    google = GoogleWebTranslator(
+        "es", concurrency=1, transport=httpx.MockTransport(google_handler),
+        min_interval=0.0, max_interval=0.0,
+    )
+    google.retry_delay_scale = 0.0
+    google.max_attempts = 4
+    microsoft = MicrosoftWebTranslator(
+        "es", concurrency=1, transport=httpx.MockTransport(_microsoft_handler(ms_calls)),
+        min_interval=0.0, max_interval=0.0,
+    )
+    microsoft.retry_delay_scale = 0.0
+
+    auto = AutoTranslator([google, microsoft])
+    async with auto:
+        results = await auto.translate_many(["First paragraph.", "Second paragraph."])
+        assert results == ["[ES] FIRST PARAGRAPH.", "[ES] SECOND PARAGRAPH."], results
+        assert google_calls, "Google debería intentarse primero"
+        assert ms_calls, "Microsoft debería haber traducido el lote"
+        assert not auto._healthy(0), "Google debería quedar apartado unos minutos"
+        assert auto.detected_lang == "en", auto.detected_lang
+
+        # Mientras Google está apartado, el relevo sigue trabajando solo.
+        used = len(google_calls)
+        results2 = await auto.translate_many(["Third paragraph."])
+        assert results2 == ["[ES] THIRD PARAGRAPH."], results2
+        assert len(google_calls) == used, "no debería molestar a Google mientras está apartado"
+
+    # Si fallan los dos proveedores, el error explica qué pasó con cada uno
+    broken = MicrosoftWebTranslator(
+        "es", concurrency=1,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(503, text="unavailable", headers={"content-type": "text/plain"})
+        ),
+        min_interval=0.0, max_interval=0.0,
+    )
+    broken.retry_delay_scale = 0.0
+    broken.max_attempts = 2
+    google2 = GoogleWebTranslator(
+        "es", concurrency=1, transport=httpx.MockTransport(google_handler),
+        min_interval=0.0, max_interval=0.0,
+    )
+    google2.retry_delay_scale = 0.0
+    google2.max_attempts = 2
+    try:
+        async with AutoTranslator([google2, broken]) as auto2:
+            await auto2.translate("Never translated.")
+    except TranslationError as err:
+        assert "Ningún traductor" in str(err), err
+    else:
+        raise AssertionError("con los dos proveedores caídos debería lanzar TranslationError")
+    print("OK · relevo automático Google → Microsoft (y error claro si fallan ambos)")
+
+
+async def test_epub_progress_units() -> None:
+    """El progreso del EPUB también avanza dentro de un documento."""
+    from epub_translate import _translate_batched
+
+    seen: list[tuple[int, int]] = []
+
+    async def on_progress(done: int, total: int) -> None:
+        seen.append((done, total))
+
+    texts = [f"Paragraph {index} of the chapter with some words." for index in range(100)]
+    results = await _translate_batched(MockTranslator(), texts, on_progress)
+    assert len(results) == 100, len(results)
+    assert results[0] == "[ES] PARAGRAPH 0 OF THE CHAPTER WITH SOME WORDS.", results[0]
+    assert seen and seen[-1] == (100, 100), seen
+    assert len(seen) >= 3, seen  # lotes de 48 + 48 + 4
+    print("OK · progreso por fragmentos dentro del documento:", seen)
+
+
 async def test_api_translator() -> None:
     """El backend de la API oficial envía varios segmentos por petición."""
     requests: list[dict] = []
@@ -959,11 +1082,14 @@ async def main() -> None:
         await test_web_fallback_and_cooldown()
         await test_web_endpoint_failover()
         await test_web_rhythm()
+        await test_microsoft_translator()
+        await test_auto_failover()
         await test_api_translator()
         await test_pdf_mock()
         await test_scanned_pdf()
         await test_pdf_cancel()
         await test_epub_mock()
+        await test_epub_progress_units()
         await test_epub_drm()
         await test_epub_resume()
         await test_pdf_resume()

@@ -1,20 +1,22 @@
-"""Traducción con Google Translate (endpoint web gratuito y API oficial).
+"""Traducción con servicios gratuitos (Google y Microsoft) y API oficial.
 
-**Backend web** (por defecto, gratis y sin API key): usa las mismas llamadas que
-hace el traductor de Google en el navegador. El servicio es público, pero limita
-la velocidad si se abusa de él (sobre todo desde IP de datacenter, como la de
-Render), por eso:
+**Backend web** (por defecto, gratis y sin API key): usa las mismas llamadas
+que hacen los traductores en el navegador.
 
-* las peticiones pasan por un semáforo (concurrencia configurable) y por un
+* **Google** (``translate_a/single`` y variantes) es el motor principal, con un
   **ritmo adaptativo**: mínimo ``WEB_MIN_INTERVAL`` segundos entre peticiones;
   si Google responde 429 el ritmo se reduce (hasta ``WEB_MAX_INTERVAL``) y se
-  recupera poco a poco cuando todo vuelve a ir bien;
-* hay varios **endpoints equivalentes** (translate.googleapis.com, clients5,
-  translate.google.com): si uno limita, se rota al siguiente;
-* cada fallo extiende un "tiempo de espera global" que todas las tareas
-  respetan (freno automático) y se reintenta con espera exponencial; si Google
-  manda la cabecera ``Retry-After`` se respeta;
-* los textos cortos se agrupan en **lotes** separados por saltos de línea para
+  recupera poco a poco cuando todo vuelve a ir bien. Además se rota entre
+  **varios endpoints equivalentes** (translate.googleapis.com, clients5,
+  translate.google.com).
+* **Microsoft** (``edge.microsoft.com/translate/translatetext``, el traductor
+  de Edge/Bing) es un proveedor **independiente**: no comparte cuota con Google,
+  así que sigue traduciendo aunque Google devuelva 429 desde la IP del servidor.
+  En modo ``auto`` (el de por defecto) es el relevo cuando Google se bloquea.
+* Cada fallo extiende un "tiempo de espera global" que todas las tareas
+  respetan (freno automático) y se reintenta con espera exponencial; si el
+  servicio manda la cabecera ``Retry-After`` se respeta.
+* Los textos cortos se agrupan en **lotes** separados por saltos de línea para
   reducir el número de peticiones (clave con novelas de +1000 capítulos).
 
 **Backend API** (``TRANSLATOR_BACKEND=api``): usa la API oficial de Google
@@ -29,6 +31,7 @@ import logging
 import random
 import re
 import time
+from typing import Callable
 
 import httpx
 
@@ -49,6 +52,17 @@ ENDPOINT = WEB_ENDPOINTS[0][0]
 
 # Los endpoints "legacy" viajan por GET (el texto va en la URL, ~3 KB máximo).
 LEGACY_MAX_CHARS = 2500
+
+# Traductor gratuito de Microsoft (el de Edge/Bing): sin API key y con límites
+# independientes de los de Google, así que sirve de relevo cuando Google limita
+# la IP (muy habitual desde servidores como Render).
+MICROSOFT_ENDPOINT = "https://edge.microsoft.com/translate/translatetext"
+
+# Relevo automático entre proveedores (TRANSLATOR_BACKEND=auto).
+AUTO_BLOCK_SECONDS = 90.0       # lo que se aparta un proveedor al ceder el turno
+AUTO_MAX_BLOCK_SECONDS = 600.0  # tope del aparte (después se vuelve a probar)
+AUTO_ABORT_STREAK = 3           # fallos seguidos que hacen ceder el turno
+AUTO_ABORT_COOLDOWN = 10.0      # o un freno global mayor que estos segundos
 
 # El endpoint web admite bastantes caracteres, pero se es conservador para
 # reducir errores y truncamientos.
@@ -87,7 +101,11 @@ def _retry_after_seconds(response: httpx.Response | None) -> float:
 
 
 class TranslationError(RuntimeError):
-    """Fallo irrecuperable al hablar con el traductor de Google."""
+    """Fallo irrecuperable al hablar con el traductor."""
+
+
+class ProviderBlockedError(TranslationError):
+    """El proveedor se está bloqueando (429 insistente): cede el turno al relevo."""
 
 
 def split_text(text: str, max_len: int = MAX_CHUNK_CHARS) -> list[str]:
@@ -166,6 +184,8 @@ class BaseTranslator:
         retry_delay_scale: float = 1.0,
         min_interval: float = 0.0,
         max_interval: float = 0.0,
+        max_attempts: int = MAX_ATTEMPTS,
+        max_cooldown: float = MAX_COOLDOWN,
     ) -> None:
         self.target_lang = target_lang
         self.source_lang = source_lang
@@ -176,19 +196,24 @@ class BaseTranslator:
         self.retry_delay_scale = max(0.0, float(retry_delay_scale))
         self.min_interval = max(0.0, float(min_interval))
         self.max_interval = max(self.min_interval, float(max_interval))
+        self.max_attempts = max(1, int(max_attempts))
+        self.max_cooldown = max(1.0, float(max_cooldown))
         self.detected_lang: str | None = None
         self.requests_done = 0
         self.chars_sent = 0
         self._transport = transport
         self._sem: asyncio.Semaphore | None = None
         self._client: httpx.AsyncClient | None = None
-        # Freno global: si Google limita, todas las tareas esperan.
+        # Freno global: si el proveedor limita, todas las tareas esperan.
         self._cooldown_until = 0.0
         self._fail_streak = 0
-        # Ritmo adaptativo (0 = sin espaciado; solo lo usa el backend web).
+        # Ritmo adaptativo (0 = sin espaciado; solo lo usan los backends web).
         self._interval = self.min_interval
         self._pace_next = 0.0
         self._pace_lock: asyncio.Lock | None = None
+        # Gancho del relevo automático (AutoTranslator): si devuelve True se
+        # abandona el intento y el proveedor de relevo toma el control.
+        self.abort_check: Callable[[], bool] | None = None
 
     # ------------------------------------------------------------------ ciclo de vida
 
@@ -328,6 +353,15 @@ class BaseTranslator:
 
     # ------------------------------------------------------------------ freno global
 
+    def cooldown_remaining(self) -> float:
+        """Segundos que le quedan al freno global (0 si no hay freno activo)."""
+        return max(0.0, self._cooldown_until - time.monotonic())
+
+    @property
+    def fail_streak(self) -> int:
+        """Fallos seguidos desde el último éxito (el relevo mira este dato)."""
+        return self._fail_streak
+
     async def _wait_cooldown(self) -> None:
         """Espera si el freno global está activo (bloqueo temporal de Google)."""
         while True:
@@ -382,7 +416,7 @@ class BaseTranslator:
         # simultáneos de otras tareas no lo inflan sin motivo.
         if time.monotonic() >= self._cooldown_until:
             self._fail_streak += 1
-        delay = min(2.0 ** min(self._fail_streak + 1, 9), MAX_COOLDOWN)
+        delay = min(2.0 ** min(self._fail_streak + 1, 9), self.max_cooldown)
         delay *= (0.75 + random.random() * 0.5) * self.retry_delay_scale
         self._cooldown_until = max(self._cooldown_until, time.monotonic() + delay)
         logger.warning(
@@ -397,7 +431,13 @@ class BaseTranslator:
         if self._client is None or self._sem is None:
             raise RuntimeError(f"El traductor debe usarse como contexto: 'async with {type(self).__name__}(...)'")
         last_err: Exception | None = None
-        for attempt in range(1, MAX_ATTEMPTS + 1):
+        for attempt in range(1, self.max_attempts + 1):
+            # Con un relevo sano disponible, un bloqueo insistente cede el turno
+            # ya en vez de castigar la tarea con esperas de minutos.
+            if attempt > 1 and self.abort_check is not None and self.abort_check():
+                raise ProviderBlockedError(
+                    f"{self.name} se está bloqueando; pasa el turno al traductor de relevo"
+                )
             await self._wait_cooldown()
             await self._pace()
             response: httpx.Response | None = None
@@ -416,15 +456,15 @@ class BaseTranslator:
             except (httpx.HTTPError, TranslationError) as err:
                 last_err = err
                 # Primero el freno global (decide según la oleada de fallos) y
-                # después se ajusta el ritmo con lo que haya pedido Google.
+                # después se ajusta el ritmo con lo que haya pedido el proveedor.
                 self._register_failure(err)
                 self._on_retryable(response, err)
-                if attempt < MAX_ATTEMPTS:
+                if attempt < self.max_attempts:
                     delay = (min(2.0 ** attempt, 20.0) + random.uniform(0.0, 1.0)) * self.retry_delay_scale
-                    logger.info("Reintento %d/%d de traducción en %.1f s", attempt, MAX_ATTEMPTS, delay)
+                    logger.info("Reintento %d/%d de traducción en %.1f s", attempt, self.max_attempts, delay)
                     if delay:
                         await asyncio.sleep(delay)
-        raise TranslationError(f"No se pudo traducir tras {MAX_ATTEMPTS} intentos: {last_err}")
+        raise TranslationError(f"No se pudo traducir tras {self.max_attempts} intentos: {last_err}")
 
     async def _send(self, client: httpx.AsyncClient, text: str) -> tuple[httpx.Response, str]:  # pragma: no cover
         """Envía una petición y devuelve la respuesta junto al formato usado."""
@@ -528,30 +568,222 @@ class GoogleWebTranslator(BaseTranslator):
         return translated, detected
 
 
-def create_translator(target_lang: str, *, concurrency: int | None = None) -> BaseTranslator:
-    """Crea el traductor configurado (web gratuito o API oficial de Google)."""
+class MicrosoftWebTranslator(BaseTranslator):
+    """Cliente del traductor gratuito de Microsoft Edge/Bing (sin API key).
+
+    Es un proveedor **independiente** del de Google: sus límites no tienen nada
+    que ver, así que sigue respondiendo aunque Google bloquee la IP del
+    servidor. En modo ``auto`` actúa de relevo.
+    """
+
+    name = "microsoft-web"
+
+    def __init__(self, target_lang: str, **kwargs) -> None:
+        kwargs.setdefault("min_interval", DEFAULT_MIN_INTERVAL)
+        kwargs.setdefault("max_interval", DEFAULT_MAX_INTERVAL)
+        super().__init__(target_lang, **kwargs)
+
+    async def _send(self, client: httpx.AsyncClient, text: str) -> tuple[httpx.Response, str]:
+        params = {"isEnterpriseClient": "false", "to": self.target_lang}
+        if self.source_lang and self.source_lang != "auto":
+            params["from"] = self.source_lang
+        # El cuerpo es una lista JSON con el texto (así lo llama el navegador).
+        return await client.post(MICROSOFT_ENDPOINT, params=params, json=[text]), "ms"
+
+    def _parse(self, response: httpx.Response, kind: str) -> tuple[str, str | None]:
+        # Ojo: este endpoint sirve JSON con Content-Type "text/plain", así que
+        # no se puede exigir "application/json"; se valida el cuerpo directamente.
+        try:
+            data = response.json()
+        except json.JSONDecodeError as err:
+            raise TranslationError("respuesta no JSON del traductor de Microsoft (posible bloqueo temporal)") from err
+        item = data[0] if isinstance(data, list) and data else None
+        if not isinstance(item, dict):
+            raise TranslationError("respuesta inesperada del traductor de Microsoft")
+        detected = None
+        info = item.get("detectedLanguage")
+        if isinstance(info, dict) and isinstance(info.get("language"), str):
+            detected = info["language"]
+        translations = item.get("translations")
+        if isinstance(translations, list) and translations and isinstance(translations[0], dict):
+            translated = translations[0].get("text")
+            if isinstance(translated, str):
+                return translated, detected
+        raise TranslationError("respuesta inesperada del traductor de Microsoft")
+
+
+class AutoTranslator:
+    """Traduce con un proveedor y, si se bloquea, continúa con el relevo.
+
+    Los límites de Google y de Microsoft son independientes: cuando uno encadena
+    429 se aparta unos minutos (con castigo creciente) y el otro toma el
+    control; pasado ese tiempo se le vuelve a dar preferencia al primero.
+    Es el modo ``TRANSLATOR_BACKEND=auto`` (el de por defecto).
+    """
+
+    name = "auto"
+
+    def __init__(
+        self,
+        translators: list[BaseTranslator],
+        *,
+        block_seconds: float = AUTO_BLOCK_SECONDS,
+        max_block_seconds: float = AUTO_MAX_BLOCK_SECONDS,
+    ) -> None:
+        if not translators:
+            raise ValueError("AutoTranslator necesita al menos un traductor")
+        self._translators = list(translators)
+        self._blocked_until = [0.0] * len(self._translators)
+        self._block_penalty = [block_seconds] * len(self._translators)
+        self.max_block_seconds = max_block_seconds
+        self.target_lang = self._translators[0].target_lang
+
+    # ------------------------------------------------------------------ estado
+
+    @property
+    def detected_lang(self) -> str | None:
+        for translator in self._translators:
+            if translator.detected_lang:
+                return translator.detected_lang
+        return None
+
+    def _healthy(self, index: int) -> bool:
+        return time.monotonic() >= self._blocked_until[index]
+
+    def _stand_down(self, index: int, reason: object) -> None:
+        """Aparta temporalmente a un proveedor y da el turno al relevo."""
+        translator = self._translators[index]
+        delay = self._block_penalty[index]
+        self._block_penalty[index] = min(delay * 2.0, self.max_block_seconds)
+        self._blocked_until[index] = max(self._blocked_until[index], time.monotonic() + delay)
+        logger.warning(
+            "Traductor %s apartado %.0f s (%s); el relevo continúa la traducción",
+            translator.name, delay, reason,
+        )
+
+    def _stand_up(self, index: int) -> None:
+        self._blocked_until[index] = 0.0
+        self._block_penalty[index] = AUTO_BLOCK_SECONDS
+
+    def _should_abort(self, index: int) -> bool:
+        """¿Merece la pena seguir esperando a este proveedor teniendo relevo?"""
+        if not any(
+            other != index and self._healthy(other)
+            for other in range(len(self._translators))
+        ):
+            return False
+        translator = self._translators[index]
+        return (
+            translator.fail_streak >= AUTO_ABORT_STREAK
+            or translator.cooldown_remaining() > AUTO_ABORT_COOLDOWN
+        )
+
+    def _order(self) -> list[int]:
+        """Proveedores por preferencia: primero los que están sanos."""
+        now = time.monotonic()
+        return sorted(
+            range(len(self._translators)),
+            key=lambda index: (
+                self._blocked_until[index] > now,
+                self._translators[index].cooldown_remaining() > 5.0,
+                index,
+            ),
+        )
+
+    # ------------------------------------------------------------------ API pública
+
+    async def _dispatch(self, method: str, argument):
+        errors: list[str] = []
+        for index in self._order():
+            translator = self._translators[index]
+            try:
+                result = await getattr(translator, method)(argument)
+            except TranslationError as err:
+                errors.append(f"{translator.name}: {err}")
+                self._stand_down(index, err)
+                continue
+            self._stand_up(index)
+            return result
+        raise TranslationError(
+            "Ningún traductor gratuito pudo completar la traducción ("
+            + " · ".join(errors) + ")"
+        )
+
+    async def translate(self, text: str) -> str:
+        return await self._dispatch("translate", text)
+
+    async def translate_many(self, texts: list[str]) -> list[str]:
+        return await self._dispatch("translate_many", texts)
+
+    async def translate_segments(self, texts: list[str]) -> list[str]:
+        return await self._dispatch("translate_many", texts)
+
+    async def detect(self, text: str) -> str | None:
+        return await self._dispatch("detect", text)
+
+    # ------------------------------------------------------------------ ciclo de vida
+
+    async def __aenter__(self) -> "AutoTranslator":
+        for index, translator in enumerate(self._translators):
+            await translator.__aenter__()
+            translator.abort_check = (lambda i=index: self._should_abort(i))
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        for translator in self._translators:
+            translator.abort_check = None
+            await translator.__aexit__(*exc)
+
+
+def create_translator(target_lang: str, *, concurrency: int | None = None):
+    """Crea el traductor configurado.
+
+    * ``auto`` (por defecto): Google y, si se bloquea, Microsoft de relevo.
+    * ``web``/``google``: solo el endpoint web gratuito de Google.
+    * ``ms``/``microsoft``/``edge``: solo el traductor gratuito de Microsoft.
+    * ``api``: API oficial de Google Cloud (requiere ``GOOGLE_API_KEY``).
+    """
     import config  # import local para evitar dependencias circulares
 
     workers = max(1, int(concurrency or config.TRANSLATE_CONCURRENCY))
-    backend = (config.TRANSLATOR_BACKEND or "web").strip().lower()
+    backend = (config.TRANSLATOR_BACKEND or "auto").strip().lower()
+    web_kwargs = {
+        "concurrency": workers,
+        "min_interval": config.WEB_MIN_INTERVAL,
+        "max_interval": config.WEB_MAX_INTERVAL,
+    }
+
     if backend in ("api", "gcp", "google-api", "official"):
         from translator_api import GoogleApiTranslator
 
         if not config.GOOGLE_API_KEY:
             logger.warning(
-                "TRANSLATOR_BACKEND=%s pero falta GOOGLE_API_KEY; se usa el endpoint web",
+                "TRANSLATOR_BACKEND=%s pero falta GOOGLE_API_KEY; se usan los endpoints gratuitos",
                 backend,
             )
-            return GoogleWebTranslator(
-                target_lang,
-                concurrency=workers,
-                min_interval=config.WEB_MIN_INTERVAL,
-                max_interval=config.WEB_MAX_INTERVAL,
-            )
-        return GoogleApiTranslator(target_lang, api_key=config.GOOGLE_API_KEY, concurrency=workers)
-    return GoogleWebTranslator(
-        target_lang,
-        concurrency=workers,
-        min_interval=config.WEB_MIN_INTERVAL,
-        max_interval=config.WEB_MAX_INTERVAL,
-    )
+            backend = "auto"
+        else:
+            return GoogleApiTranslator(target_lang, api_key=config.GOOGLE_API_KEY, concurrency=workers)
+
+    microsoft = MicrosoftWebTranslator(target_lang, **web_kwargs)
+    if backend in ("ms", "microsoft", "edge", "bing"):
+        return microsoft
+
+    google = GoogleWebTranslator(target_lang, **web_kwargs)
+    if backend in ("google", "web", "free"):
+        return google
+
+    if backend not in ("auto", "automatic", "fallback", ""):
+        logger.warning(
+            "TRANSLATOR_BACKEND=%s desconocido; se usa el modo automático (Google + Microsoft)",
+            backend,
+        )
+
+    # Modo "auto": Google primero y Microsoft de relevo. Con relevo disponible
+    # ninguno de los dos necesita tanta paciencia: cuando uno se atasca, cede el
+    # turno en segundos en lugar de castigar la tarea con esperas de minutos.
+    google.max_attempts = 5
+    google.max_cooldown = 45.0
+    microsoft.max_attempts = 8
+    microsoft.max_cooldown = 120.0
+    return AutoTranslator([google, microsoft])

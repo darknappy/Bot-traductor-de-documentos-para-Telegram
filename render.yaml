@@ -47,7 +47,7 @@ services:
       - key: MAX_CONCURRENT_JOBS
         value: "1"
       - key: TRANSLATOR_BACKEND
-        value: web
+        value: auto
       - key: CACHE_TTL_DAYS
         value: "7"
       - key: CACHE_MAX_MB
