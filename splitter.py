@@ -162,10 +162,15 @@ def _safe_name(name: str, max_len: int = 120) -> str:
     return name[:max_len].rstrip() if len(name) > max_len else name
 
 
-def _part_name(stem: str, index: int, count: int, label: str, suffix: str) -> str:
+def _part_name(stem: str, index: int, count: int, suffix: str) -> str:
+    """Nombre de una parte: solo indica qué parte es.
+
+    El rango de capítulos («caps. 1-50») no va en el nombre porque la numeración
+    detectada no siempre coincide con la real; queda en la leyenda del mensaje.
+    """
     width = max(2, len(str(count)))
     base = _safe_name(stem, 90)
-    name = f"{base} - Parte {index:0{width}d} de {count:0{width}d} ({label}){suffix}"
+    name = f"{base} - Parte {index:0{width}d} de {count:0{width}d}{suffix}"
     if len(name) > 150:
         keep = 150 - len(suffix)
         name = name[:keep].rstrip(" .-_()") + suffix
@@ -592,7 +597,7 @@ def _split_epub(
             ]
             new_ncx = _build_ncx(ncx_path, ncx_uid, part_title, toc_entries) if ncx_path else None
             new_nav = _build_nav(nav_path, book_title, toc_entries) if nav_path else None
-            name = _part_name(stem, part_index + 1, parts_count, part_label, ".epub")
+            name = _part_name(stem, part_index + 1, parts_count, ".epub")
             out_path = out_dir / name
             with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zout:
                 info = zipfile.ZipInfo("mimetype", date_time=_FIXED_ZIP_TIME)
@@ -726,7 +731,7 @@ def _split_text(
         start = 0 if first == 0 else boundaries[first]  # el prólogo abre la primera sección
         end = boundaries[last + 1] if last + 1 < total else len(lines)
         label = _range_label(titles, first, last, _LABEL_CHAPTERS)
-        name = _part_name(stem, part_index + 1, parts_count, label, suffix)
+        name = _part_name(stem, part_index + 1, parts_count, suffix)
         out_path = out_dir / name
         # Se escribe en binario para conservar los finales de línea originales.
         out_path.write_bytes("".join(lines[start:end]).encode("utf-8"))
@@ -824,7 +829,7 @@ def _split_pdf(
                         except Exception:  # noqa: BLE001 - el índice es opcional
                             logger.debug("No se pudo escribir el índice de la sección", exc_info=True)
                 label = _range_label(None, first_unit, last_unit, label_nouns)
-                name = _part_name(stem, part_index + 1, parts_count, label, ".pdf")
+                name = _part_name(stem, part_index + 1, parts_count, ".pdf")
                 out_path = out_dir / name
                 part.save(str(out_path))
             finally:

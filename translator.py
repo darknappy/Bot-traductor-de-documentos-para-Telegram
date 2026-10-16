@@ -64,6 +64,28 @@ AUTO_MAX_BLOCK_SECONDS = 600.0  # tope del aparte (después se vuelve a probar)
 AUTO_ABORT_STREAK = 3           # fallos seguidos que hacen ceder el turno
 AUTO_ABORT_COOLDOWN = 10.0      # o un freno global mayor que estos segundos
 
+# --- Indicador del motor que traduce ahora mismo (progreso y /status) ----------
+ENGINE_LABELS: dict[str, str] = {
+    "google-web": "Google",
+    "microsoft-web": "Microsoft",
+    "google-api": "Google Cloud (API)",
+}
+_engine_state: dict = {"name": None, "label": "", "at": 0.0}
+
+
+def record_engine(name: str) -> None:
+    """Apunta qué motor acaba de traducir bien (Google, Microsoft…)."""
+    _engine_state["name"] = name
+    _engine_state["label"] = ENGINE_LABELS.get(name, name)
+    _engine_state["at"] = time.monotonic()
+
+
+def active_engine(max_age: float = 300.0) -> tuple[str, str] | None:
+    """Motor en uso ahora mismo, o ``None`` si lleva un rato sin traducir."""
+    if not _engine_state["name"] or time.monotonic() - _engine_state["at"] > max_age:
+        return None
+    return str(_engine_state["name"]), str(_engine_state["label"])
+
 # El endpoint web admite bastantes caracteres, pero se es conservador para
 # reducir errores y truncamientos.
 MAX_CHUNK_CHARS = 4000
@@ -452,6 +474,7 @@ class BaseTranslator:
                 result = self._parse(response, kind)
                 self._fail_streak = 0
                 self._speed_up()
+                record_engine(self.name)
                 return result
             except (httpx.HTTPError, TranslationError) as err:
                 last_err = err

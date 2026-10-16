@@ -623,6 +623,7 @@ def test_split_text() -> None:
     assert len(report.parts) == 3, [p.label for p in report.parts]
     assert [p.label for p in report.parts] == ["caps. 1-50", "caps. 51-100", "caps. 101-130"]
     assert report.parts[0].name.startswith("novela_split - Parte 01 de 03")
+    assert "(caps." not in report.parts[0].name, "el nombre no debe numerar capítulos"
 
     first = report.parts[0].path.read_text("utf-8")
     assert first.startswith("Novela de prueba"), "el prólogo debería abrir la primera sección"
@@ -788,6 +789,10 @@ async def test_web_batches() -> None:
     assert "PARAGRAPH NUMBER 0" in results[0], results[0]
     assert translator.detected_lang == "en"
 
+    import translator as translator_module
+
+    assert translator_module.active_engine() == ("google-web", "Google"), translator_module.active_engine()
+
     # Muchos textos: varios lotes, todos correctos
     calls.clear()
     many = [f"Sentence {index} of the book that we are translating today." for index in range(200)]
@@ -951,6 +956,10 @@ async def test_microsoft_translator() -> None:
     assert results == ["[ES] FIRST PARAGRAPH.", "[ES] SECOND PARAGRAPH.", "[ES] THIRD PARAGRAPH."], results
     assert len(calls) == 1, f"los tres textos deberían ir en un lote: {calls}"
     assert translator.detected_lang == "en", translator.detected_lang
+
+    import translator as translator_module
+
+    assert translator_module.active_engine() == ("microsoft-web", "Microsoft"), translator_module.active_engine()
     print("OK · traductor gratuito de Microsoft (lotes y detección de idioma)")
 
 
@@ -983,6 +992,13 @@ async def test_auto_failover() -> None:
         assert ms_calls, "Microsoft debería haber traducido el lote"
         assert not auto._healthy(0), "Google debería quedar apartado unos minutos"
         assert auto.detected_lang == "en", auto.detected_lang
+
+        import translator as translator_module
+
+        assert translator_module.active_engine() == (
+            "microsoft-web",
+            "Microsoft",
+        ), translator_module.active_engine()
 
         # Mientras Google está apartado, el relevo sigue trabajando solo.
         used = len(google_calls)
@@ -1215,6 +1231,30 @@ def test_ui_helpers() -> None:
     assert any(b.api_kwargs for row in markup.inline_keyboard for b in row), "faltan los colores"
     plain = bot_module._plain_markup(markup)
     assert all(not b.api_kwargs for row in plain.inline_keyboard for b in row)
+
+    # Selector de capítulos por sección de «dividir y traducir»
+    chapters = bot_module._chapters_markup("tok12345")
+    datas = [b.callback_data for row in chapters.inline_keyboard for b in row]
+    assert datas == [
+        "fbc:tok12345:25",
+        "fbc:tok12345:50",
+        "fbc:tok12345:75",
+        "fbc:tok12345:100",
+        "fx:tok12345:v",
+    ], datas
+    menu_chapters = bot_module._chapters_markup()
+    datas = [b.callback_data for row in menu_chapters.inline_keyboard for b in row]
+    assert datas == ["mbc:25", "mbc:50", "mbc:75", "mbc:100"], datas
+    assert "capítulos por sección" in bot_module._chapters_text("novela.epub")
+
+    # Indicador del motor que está traduciendo (Google / Microsoft)
+    import translator as translator_module
+
+    translator_module.record_engine("microsoft-web")
+    assert translator_module.active_engine() == ("microsoft-web", "Microsoft")
+    assert translator_module.active_engine(max_age=-1.0) is None, "el motor debe caducar"
+    translator_module.record_engine("google-web")
+    assert translator_module.active_engine() == ("google-web", "Google")
 
     # La ETA solo aparece cuando ya hay datos suficientes para estimar
     assert bot_module._eta_text(0.02, 600) is None

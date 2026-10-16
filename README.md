@@ -15,7 +15,9 @@ los devuelve traducidos. También traduce mensajes de texto sueltos.
   por capítulos, TXT/MD por sus encabezados, PDF por índice o páginas) para
   traducirlas por separado y reenviar solo la que falle.
 - **🔀 /ambos** → divide la novela y traduce cada sección por separado: primero
-  recibes todas las secciones sin tocar y después cada una traducida.
+  recibes todas las secciones sin tocar y después cada una traducida. El tamaño
+  de las secciones se elige con botones (**25 / 50 / 75 / 100 capítulos**), nada
+  automático.
 - **Menú de botones fijo** → un teclado siempre visible (🌐 Traducir · ✂️
   Dividir · 🔀 Dividir y traducir · ⚙️ Idioma · 📊 Estado · 🚫 Cancelar · ❓
   Ayuda). Si envías un archivo sin haber elegido nada, el bot te pregunta qué
@@ -23,7 +25,8 @@ los devuelve traducidos. También traduce mensajes de texto sueltos.
 
 Pensado también para **novelas web de gran volumen (+1000 capítulos)**: traduce
 por lotes, **si Google limita la velocidad cambia solo a Microsoft** (cuota
-independiente), muestra el progreso también **dentro de cada capítulo**, guarda
+independiente) y el progreso muestra **con qué motor está traduciendo en ese
+momento**, muestra el avance también **dentro de cada capítulo**, guarda
 el progreso capítulo a capítulo, **reanuda** donde se quedó y puede **dividir la
 novela en secciones** para que un fallo solo cueste reenviar una parte.
 
@@ -152,6 +155,8 @@ services:
 2. Toca **🌐 Traducir** (u otra opción) y envíale el archivo; o envía el
    archivo directamente y el bot te preguntará qué hacer con él:
    *«🌐 Traducir · ✂️ Dividir · 🔀 Dividir y traducir cada parte · 🗑️ Descartar»*.
+   Si eliges 🔀, primero te pide **cuántos capítulos por sección** (25/50/75/100)
+   con botones.
 3. El bot muestra el progreso y te devuelve el resultado.
 
 No hace nada hasta que elijas una acción: si envías un archivo sin modo y sin
@@ -169,9 +174,9 @@ pie de foto del propio archivo (`/traducir`, `/dividir 25`, `/ambos`).
 | `/dividir` | El próximo archivo se parte en secciones sin traducir |
 | `/dividir 25` | …en secciones de 25 capítulos (en PDF, 25 páginas) |
 | `/dividir 8 partes` | …en 8 secciones iguales |
-| `/ambos` | El próximo archivo se divide y después se traduce cada sección |
-| `/ambos 25` | …con secciones de 25 capítulos |
-| `/status` | Cola, tareas en curso y tamaño de la caché (con botón 🔄) |
+| `/ambos` | El próximo archivo se divide y se traduce cada sección (te pide el tamaño con botones) |
+| `/ambos 25` | …con secciones de 25 capítulos, sin preguntar |
+| `/status` | Cola, tareas en curso, motor en uso y tamaño de la caché (con botón 🔄) |
 | `/cancel` | Cancela la tarea en curso |
 
 También puedes escribirle un texto normal y te lo traduce al momento.
@@ -190,6 +195,10 @@ el pie de foto) y el bot te devuelve el libro **sin traducir** troceado:
 - **PDF** → usa los marcadores/índice del PDF si los tiene; si no, corta por
   páginas.
 
+Los archivos de salida se llaman «Libro - Parte 03 de 08.epub»: el nombre solo
+indica la parte. El rango de capítulos queda en el pie de foto del mensaje,
+porque la numeración detectada no siempre coincide con la real del libro.
+
 Después envía cada sección como un archivo normal: se traduce por separado, se
 guarda en la caché por separado y, si algo falla o el bot se reinicia, **solo
 reenvías esa sección** en lugar de la novela completa (perfecto para el plan
@@ -198,10 +207,12 @@ gratuito con disco efímero).
 ### 🔀 Dividir y traducir (`/ambos`)
 
 Si prefieres que el bot haga las dos cosas, toca **🔀 Dividir y traducir** (o
-envía el archivo con la leyenda «`/ambos`»):
+envía el archivo con la leyenda «`/ambos`»). El bot te pide **cuántos capítulos
+por sección** con botones (25 / 50 / 75 / 100; en PDF se cuentan páginas) y
+después:
 
-1. El bot te manda **todas las secciones sin traducir** (guárdalas de reserva).
-2. Después traduce **cada sección por separado** y te la envía terminada, con su
+1. Te manda **todas las secciones sin traducir** (guárdalas de reserva).
+2. Traduce **cada sección por separado** y te la envía terminada, con su
    progreso («parte 3 de 8 · capítulo 12/50») en el mismo mensaje.
 
 Cada sección se guarda en la caché con su propia clave y la división es

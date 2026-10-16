@@ -54,7 +54,7 @@ from pipeline import (
     safe_filename,
 )
 from splitter import SplitPart, SplitSpec, describe_spec, parse_split_command
-from translator import TranslationError, create_translator
+from translator import TranslationError, active_engine, create_translator
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -100,6 +100,8 @@ _MODE_HEADERS = {
 }
 _MODE_NAMES = {"translate": "traducción", "split": "división", "both": "dividir y traducir"}
 _ACTION_MODES = {"t": "translate", "d": "split", "b": "both"}
+# Tamaños de sección que ofrece el selector de «dividir y traducir»: nada automático.
+_CHAPTER_CHOICES = (25, 50, 75, 100)
 _CAPTION_MODES = {
     "traducir": "translate",
     "translate": "translate",
@@ -257,6 +259,41 @@ def _status_markup() -> InlineKeyboardMarkup:
     )
 
 
+def _chapters_markup(token: str | None = None) -> InlineKeyboardMarkup:
+    """Selector de capítulos por sección para «dividir y traducir».
+
+    Con ``token`` (archivo ya recibido) los botones empiezan por ``fbc:`` y
+    llevan «Volver»; sin él (menú o /ambos) empiezan por ``mbc:``.
+    """
+    prefix = f"fbc:{token}" if token else "mbc"
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"{count} capítulos",
+                callback_data=f"{prefix}:{count}",
+                api_kwargs=_style("primary"),
+            )
+            for count in _CHAPTER_CHOICES[start : start + 2]
+        ]
+        for start in (0, 2)
+    ]
+    if token:
+        rows.append([InlineKeyboardButton("🔙 Volver", callback_data=f"fx:{token}:v")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _chapters_text(file_name: str | None = None) -> str:
+    lead = f"📄 <b>{html.escape(file_name)}</b>\n" if file_name else ""
+    return (
+        lead
+        + "📐 <b>¿Cuántos capítulos por sección?</b>\n"
+        "<blockquote>🔀 «Dividir y traducir» usará ese tamaño para cada parte "
+        "(en PDF se cuentan páginas).\n"
+        "• Con menos capítulos, cada sección es más pequeña y más fácil de reenviar "
+        "si algo falla.</blockquote>"
+    )
+
+
 # --------------------------------------------------------------------------- mensajes
 
 
@@ -269,8 +306,8 @@ def help_text(lang: str) -> str:
         "estilos y enlaces del EPUB.\n"
         "✂️ <b>Dividir</b> — parte una novela larga en secciones <i>sin traducir</i> "
         "(ideal para +100 capítulos).\n"
-        "🔀 <b>Dividir y traducir</b> — te manda las secciones y después traduce cada "
-        "una por separado.</blockquote>\n\n"
+        "🔀 <b>Dividir y traducir</b> — elige 25/50/75/100 capítulos por sección: te "
+        "manda las secciones y después traduce cada una.</blockquote>\n\n"
         f"🌐 Idioma de destino: <b>{html.escape(languages.language_name(lang))}</b> · "
         "cámbialo con ⚙️ <b>Idioma</b>\n\n"
         "<blockquote expandable>💡 <b>Trucos y comandos</b>\n"
@@ -283,6 +320,7 @@ def help_text(lang: str) -> str:
         f"• Tamaño máximo por archivo: {config.MAX_INPUT_MB} MB (límite de Telegram).\n"
         "• Los libros enormes guardan el progreso: reenvía el mismo archivo y continúo "
         "donde iba.\n"
+        "• Mientras traduzco verás con qué motor trabajo (Google o Microsoft).\n"
         "• Comandos: /lang · /dividir · /status · /cancel · /help</blockquote>"
     )
 
@@ -291,13 +329,16 @@ def status_text() -> str:
     """Resumen del estado del bot (se usa en /status)."""
     snapshot = _status_snapshot()
     active = snapshot.get("active") or []
+    engine = active_engine()
+    engine_line = f"\n🛰️ Traduciendo con <b>{html.escape(engine[1])}</b>" if engine else ""
     lines = [
         "📊 <b>Estado del bot</b>",
         "<blockquote>"
         f"🟢 Activo desde hace {format_duration(snapshot.get('uptime_seconds', 0))}\n"
         f"⚙️ Motor: <code>{html.escape(str(config.TRANSLATOR_BACKEND))}</code> · "
         f"{config.TRANSLATE_CONCURRENCY} traducciones en paralelo\n"
-        f"📥 En cola: {snapshot.get('queue', 0)} · 🧵 En proceso: {len(active)}\n"
+        f"📥 En cola: {snapshot.get('queue', 0)} · 🧵 En proceso: {len(active)}"
+        f"{engine_line}\n"
         f"💾 Resultados guardados: {snapshot.get('cache_files', 0)} archivo(s) · "
         f"{snapshot.get('cache_mb', 0):.0f} MB"
         "</blockquote>",
@@ -330,7 +371,11 @@ def _progress_text(task: DocumentTask, fraction: float, note: str, elapsed: floa
     header = _MODE_HEADERS.get(task.mode, _MODE_HEADERS["translate"])
     lines = [header, f"📄 <code>{html.escape(task.file_name)}</code>"]
     if task.mode != "split":
-        lines.append(f"🌐 → {html.escape(languages.language_name(task.lang))}")
+        lang_line = f"🌐 → {html.escape(languages.language_name(task.lang))}"
+        engine = active_engine()
+        if engine:
+            lang_line += f" · ⚙️ <b>{html.escape(engine[1])}</b>"
+        lines.append(lang_line)
     lines.append(f"{bar} <b>{int(round(fraction * 100))}%</b> · {html.escape(note)}")
     time_line = f"⏱️ {format_duration(elapsed)}"
     eta = _eta_text(fraction, elapsed)
@@ -394,6 +439,7 @@ def _mode_confirmation(mode: str, lang: str, spec: SplitSpec | None) -> str:
     if mode == "both":
         return (
             "🔀 <b>Modo «dividir y traducir» activado</b>\n"
+            f"Tamaño: {html.escape(describe_spec(spec))}.\n"
             "Te enviaré primero todas las secciones <b>sin traducir</b> y después iré "
             "traduciendo cada una.\n"
             "<blockquote>🧩 Cada sección se traduce por separado: si una falla, las demás "
@@ -615,9 +661,15 @@ async def cmd_traducir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cmd_ambos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/ambos: el próximo documento se divide y se traduce por secciones."""
+    """/ambos: el próximo documento se divide y se traduce por secciones.
+
+    Sin número, el tamaño de las secciones se elige con botones (25/50/75/100).
+    """
     args = context.args or []
-    spec = parse_split_command("/dividir " + " ".join(args)) if args else None
+    if not args:
+        await _send_html(update.message.reply_text, _chapters_text(), _chapters_markup())
+        return
+    spec = parse_split_command("/dividir " + " ".join(args))
     context.user_data["file_action"] = {"mode": "both", "spec": spec}
     lang = users.get_lang(update.effective_user.id)
     await _send_html(update.message.reply_text, _mode_confirmation("both", lang, spec), _mode_markup())
@@ -635,11 +687,14 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     mode = {
         MENU_TRANSLATE: "translate",
         MENU_SPLIT: "split",
-        MENU_BOTH: "both",
     }.get(label)
     if mode is not None:
         context.user_data["file_action"] = {"mode": mode, "spec": None}
         await _send_html(message.reply_text, _mode_confirmation(mode, lang, None), _mode_markup())
+        return
+    if label == MENU_BOTH:
+        # Nada de tamaño automático: se elige con botones.
+        await _send_html(message.reply_text, _chapters_text(), _chapters_markup())
         return
     if label == MENU_LANG:
         await _send_html(message.reply_text, _lang_menu_text(lang), _lang_menu_markup(lang))
@@ -680,9 +735,19 @@ async def on_status_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def _ask_file_action(
-    message, context: ContextTypes.DEFAULT_TYPE, document, file_name: str, size: int
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    document,
+    file_name: str,
+    size: int,
+    *,
+    both_count: bool = False,
 ) -> None:
-    """Pregunta qué hacer con el archivo (sin descargarlo todavía)."""
+    """Pregunta qué hacer con el archivo (sin descargarlo todavía).
+
+    Con ``both_count=True`` muestra directamente el selector de capítulos por
+    sección (para «dividir y traducir»).
+    """
     user = message.from_user
     lang = users.get_lang(user.id)
     token = uuid.uuid4().hex[:8]
@@ -698,11 +763,11 @@ async def _ask_file_action(
             previous["question_id"],
             "⏭️ Sustituido por un archivo más reciente.",
         )
-    question = await _send_html(
-        message.reply_text,
-        _file_question_text(file_name, size, lang),
-        _file_action_keyboard(token),
-    )
+    if both_count:
+        text, markup = _chapters_text(file_name), _chapters_markup(token)
+    else:
+        text, markup = _file_question_text(file_name, size, lang), _file_action_keyboard(token)
+    question = await _send_html(message.reply_text, text, markup)
     store[user.id] = {
         "token": token,
         "chat_id": message.chat_id,
@@ -757,6 +822,10 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if mode is None:
         await _ask_file_action(message, context, document, file_name, size)
         return
+    if mode == "both" and spec is None:
+        # «Dividir y traducir» sin tamaño: nada automático, se elige con botones.
+        await _ask_file_action(message, context, document, file_name, size, both_count=True)
+        return
 
     await _start_task(
         context,
@@ -793,6 +862,30 @@ async def on_file_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _edit_status(context, entry["chat_id"], entry["question_id"], "🗑️ Archivo descartado.")
         return
 
+    if action == "v":  # volver a la pregunta inicial
+        await query.answer()
+        try:
+            await _send_html(
+                query.edit_message_text,
+                _file_question_text(entry["file_name"], entry["size"], users.get_lang(user.id)),
+                _file_action_keyboard(token),
+            )
+        except TelegramError:
+            pass
+        return
+
+    if action == "b":  # «dividir y traducir»: primero el tamaño de las secciones
+        await query.answer("Elige cuántos capítulos por sección")
+        try:
+            await _send_html(
+                query.edit_message_text,
+                _chapters_text(entry["file_name"]),
+                _chapters_markup(token),
+            )
+        except TelegramError:
+            pass
+        return
+
     mode = _ACTION_MODES.get(action)
     if mode is None:
         await query.answer()
@@ -821,6 +914,64 @@ async def on_file_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reply_source=None,
         )
     )
+
+
+async def on_file_both_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Elige capítulos por sección para un archivo ya recibido (selector 🔀)."""
+    query = update.callback_query
+    user = query.from_user
+    parts = (query.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "fbc" or not parts[2].isdigit():
+        return
+    token, count = parts[1], int(parts[2])
+    if count not in _CHAPTER_CHOICES:
+        await query.answer()
+        return
+    store: dict = context.application.bot_data.get(_PENDING_FILES_KEY) or {}
+    entry = store.get(user.id)
+    if entry is None or entry.get("token") != token:
+        await query.answer("Esa selección ya no está activa: reenvía el archivo.", show_alert=True)
+        return
+    await query.answer(f"Secciones de {count} capítulos")
+    store.pop(user.id, None)
+    context.application.create_task(
+        _start_task(
+            context,
+            user_id=user.id,
+            chat_id=entry["chat_id"],
+            file_id=entry["file_id"],
+            file_name=entry["file_name"],
+            size=entry["size"],
+            src_message_id=entry["message_id"],
+            mode="both",
+            spec=SplitSpec("units", count),
+            status_message_id=entry["question_id"],
+            reply_source=None,
+        )
+    )
+
+
+async def on_menu_both_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Elige capítulos por sección desde el menú o /ambos (sin archivo todavía)."""
+    query = update.callback_query
+    parts = (query.data or "").split(":")
+    if len(parts) != 2 or parts[0] != "mbc" or not parts[1].isdigit():
+        return
+    count = int(parts[1])
+    if count not in _CHAPTER_CHOICES:
+        await query.answer()
+        return
+    spec = SplitSpec("units", count)
+    context.user_data["file_action"] = {"mode": "both", "spec": spec}
+    await query.answer(f"Secciones de {count} capítulos")
+    try:
+        await _send_html(
+            query.edit_message_text,
+            _mode_confirmation("both", users.get_lang(query.from_user.id), spec),
+            _mode_markup(),
+        )
+    except TelegramError:
+        pass
 
 
 async def _start_task(
@@ -1248,6 +1399,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(on_lang_button, pattern=r"^lang:"))
     app.add_handler(CallbackQueryHandler(on_file_action, pattern=r"^fx:"))
+    app.add_handler(CallbackQueryHandler(on_file_both_count, pattern=r"^fbc:"))
+    app.add_handler(CallbackQueryHandler(on_menu_both_count, pattern=r"^mbc:"))
     app.add_handler(CallbackQueryHandler(on_mode_off, pattern=r"^mode:off$"))
     app.add_handler(CallbackQueryHandler(on_status_refresh, pattern=r"^status:refresh$"))
     app.add_handler(MessageHandler(filters.Text(list(MENU_LABELS)), on_menu_button))
