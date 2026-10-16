@@ -1171,7 +1171,7 @@ def test_build_app() -> None:
         app = bot_module.build_app()
     finally:
         config.TELEGRAM_BOT_TOKEN = original
-    from telegram.ext import CommandHandler, MessageHandler
+    from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler
 
     handlers = app.handlers[0]
     commands = {
@@ -1180,10 +1180,46 @@ def test_build_app() -> None:
         if isinstance(handler, CommandHandler)
         for command in handler.commands
     }
-    assert {"start", "help", "lang", "dividir", "status", "cancel"} <= commands, commands
+    assert {
+        "start", "help", "lang", "traducir", "dividir", "ambos", "status", "cancel"
+    } <= commands, commands
     assert any(isinstance(handler, MessageHandler) for handler in handlers)
+    assert sum(isinstance(handler, CallbackQueryHandler) for handler in handlers) >= 4
     assert app.error_handlers, "falta el manejador de errores"
     print("OK · aplicación de Telegram construida con", len(handlers), "handlers")
+
+
+def test_ui_helpers() -> None:
+    """Menú fijo, teclados de acción, leyendas y estimación de tiempo restante."""
+    import bot as bot_module
+
+    assert bot_module.parse_caption_action("/dividir 3") == ("split", SplitSpec("units", 3))
+    assert bot_module.parse_caption_action("dividir 8 partes") == ("split", SplitSpec("parts", 8))
+    assert bot_module.parse_caption_action("/dividir@MiBot 3") == ("split", SplitSpec("units", 3))
+    assert bot_module.parse_caption_action("/traducir") == ("translate", None)
+    assert bot_module.parse_caption_action("/Traducir ") == ("translate", None)
+    assert bot_module.parse_caption_action("/ambos") == ("both", None)
+    assert bot_module.parse_caption_action("/ambos 20") == ("both", SplitSpec("units", 20))
+    assert bot_module.parse_caption_action("hola mundo") is None
+    assert bot_module.parse_caption_action("") is None
+
+    kb = bot_module.main_keyboard()
+    texts = [button.text for row in kb.keyboard for button in row]
+    for label in bot_module.MENU_LABELS:
+        assert label in texts, label
+    assert kb.is_persistent and kb.resize_keyboard
+
+    markup = bot_module._file_action_keyboard("tok12345")
+    datas = [b.callback_data for row in markup.inline_keyboard for b in row]
+    assert datas == ["fx:tok12345:t", "fx:tok12345:d", "fx:tok12345:b", "fx:tok12345:x"], datas
+    assert any(b.api_kwargs for row in markup.inline_keyboard for b in row), "faltan los colores"
+    plain = bot_module._plain_markup(markup)
+    assert all(not b.api_kwargs for row in plain.inline_keyboard for b in row)
+
+    # La ETA solo aparece cuando ya hay datos suficientes para estimar
+    assert bot_module._eta_text(0.02, 600) is None
+    assert bot_module._eta_text(0.5, 600) is not None
+    print("OK · menú fijo, teclados de acción y ETA")
 
 
 async def test_worker_integration() -> None:
@@ -1321,6 +1357,40 @@ async def test_worker_integration() -> None:
             "dividido en <b>3 partes</b>" in edit.get("text", "") for edit in app.bot.edits
         ), "falta el resumen de la división"
         assert not workdir3.exists(), "no se limpió el directorio temporal de la división"
+
+        # Modo «dividir y traducir»: secciones sin traducir + cada una traducida
+        both_id = "integracion04"
+        workdir4 = config.WORK_DIR / both_id
+        workdir4.mkdir(parents=True, exist_ok=True)
+        novel2 = workdir4 / "novela2.txt"
+        make_novel_txt(novel2, chapters=10)
+        both_task = DocumentTask(
+            task_id=both_id,
+            user_id=96,
+            chat_id=96,
+            status_message_id=9,
+            src_message_id=None,
+            src_path=novel2,
+            file_name="novela2.txt",
+            lang="es",
+            mode="both",
+            split_spec=SplitSpec("units", 5),
+        )
+        documents_before = len(app.bot.documents)
+        app.bot_data[bot_module._PENDING_KEY][96] = both_task
+        queue.put_nowait(both_task)
+        await asyncio.wait_for(queue.join(), timeout=60)
+        both_docs = app.bot.documents[documents_before:]
+        assert len(both_docs) == 4, [d["filename"] for d in both_docs]
+        raws = [d for d in both_docs if "Sin traducir" in d["caption"]]
+        dones = [d for d in both_docs if "Traducida" in d["caption"]]
+        assert len(raws) == 2 and len(dones) == 2, [d["caption"] for d in both_docs]
+        assert all("[ES]" in d["filename"] for d in dones), dones
+        assert all("[ES]" not in d["filename"] for d in raws), raws
+        assert any("partes traducidas" in edit.get("text", "") for edit in app.bot.edits), (
+            "falta el resumen final del modo «dividir y traducir»"
+        )
+        assert not workdir4.exists(), "no se limpió el directorio temporal del modo «ambos»"
     finally:
         worker.cancel()
         pipeline.create_translator = original_factory
@@ -1329,7 +1399,8 @@ async def test_worker_integration() -> None:
         shutil.rmtree(config.WORK_DIR / "integracion01", ignore_errors=True)
         shutil.rmtree(config.WORK_DIR / "integracion01b", ignore_errors=True)
         shutil.rmtree(config.WORK_DIR / "integracion03", ignore_errors=True)
-    print("OK · cola de trabajo, envío, caché y división (bot falso)")
+        shutil.rmtree(config.WORK_DIR / "integracion04", ignore_errors=True)
+    print("OK · cola de trabajo, envío, caché, división y modo «ambos» (bot falso)")
 
 
 async def test_real_google() -> None:
@@ -1365,6 +1436,7 @@ async def main() -> None:
     try:
         test_utilidades()
         test_build_app()
+        test_ui_helpers()
         await test_health_server()
         await test_job_store()
         await test_web_batches()

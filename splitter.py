@@ -477,6 +477,22 @@ def _build_nav(nav_path: str, book_title: str, toc_entries: list[tuple[str, str]
     ).encode("utf-8")
 
 
+_FIXED_ZIP_TIME = (1980, 1, 1, 0, 0, 0)
+
+
+def _write_member(zout: zipfile.ZipFile, name: str, data: bytes) -> None:
+    """Escribe un miembro del zip con fecha fija: la división queda reproducible.
+
+    Así, partir dos veces el mismo libro produce secciones idénticas byte a byte
+    y la caché de traducciones puede reutilizarlas (importante en el modo
+    «dividir y traducir»).
+    """
+    info = zipfile.ZipInfo(name, date_time=_FIXED_ZIP_TIME)
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = 0o644 << 16
+    zout.writestr(info, data)
+
+
 def _split_epub(
     src_path: Path, stem: str, out_dir: Path, spec: SplitSpec | None, cancel, display: str
 ) -> SplitReport:
@@ -579,7 +595,7 @@ def _split_epub(
             name = _part_name(stem, part_index + 1, parts_count, part_label, ".epub")
             out_path = out_dir / name
             with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zout:
-                info = zipfile.ZipInfo("mimetype", date_time=(1980, 1, 1, 0, 0, 0))
+                info = zipfile.ZipInfo("mimetype", date_time=_FIXED_ZIP_TIME)
                 zout.writestr(info, b"application/epub+zip", compress_type=zipfile.ZIP_STORED)
                 for member in zin.namelist():
                     if member.endswith("/") or member == "mimetype":
@@ -587,13 +603,13 @@ def _split_epub(
                     if _norm(member) in removed_paths:
                         continue
                     if member == opf_name:
-                        zout.writestr(member, new_opf)
+                        _write_member(zout, member, new_opf)
                     elif nav_path and member == nav_path and new_nav is not None:
-                        zout.writestr(member, new_nav)
+                        _write_member(zout, member, new_nav)
                     elif ncx_path and member == ncx_path and new_ncx is not None:
-                        zout.writestr(member, new_ncx)
+                        _write_member(zout, member, new_ncx)
                     else:
-                        zout.writestr(member, zin.read(member))
+                        _write_member(zout, member, zin.read(member))
             report.parts.append(
                 SplitPart(
                     path=out_path,

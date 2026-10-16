@@ -14,6 +14,12 @@ los devuelve traducidos. También traduce mensajes de texto sueltos.
 - **✂️ /dividir** → parte una novela larga en secciones **sin traducir** (EPUB
   por capítulos, TXT/MD por sus encabezados, PDF por índice o páginas) para
   traducirlas por separado y reenviar solo la que falle.
+- **🔀 /ambos** → divide la novela y traduce cada sección por separado: primero
+  recibes todas las secciones sin tocar y después cada una traducida.
+- **Menú de botones fijo** → un teclado siempre visible (🌐 Traducir · ✂️
+  Dividir · 🔀 Dividir y traducir · ⚙️ Idioma · 📊 Estado · 🚫 Cancelar · ❓
+  Ayuda). Si envías un archivo sin haber elegido nada, el bot te pregunta qué
+  hacer con botones en vez de ponerse a traducir solo.
 
 Pensado también para **novelas web de gran volumen (+1000 capítulos)**: traduce
 por lotes, **si Google limita la velocidad cambia solo a Microsoft** (cuota
@@ -141,9 +147,16 @@ services:
 
 ## Uso
 
-1. Abre tu bot en Telegram y pulsa **Iniciar**.
-2. Envíale un archivo (PDF, EPUB, TXT o MD).
-3. El bot muestra el progreso y te devuelve el archivo traducido.
+1. Abre tu bot en Telegram y pulsa **Iniciar**: verás el **menú de botones**
+   fijo bajo el campo de texto.
+2. Toca **🌐 Traducir** (u otra opción) y envíale el archivo; o envía el
+   archivo directamente y el bot te preguntará qué hacer con él:
+   *«🌐 Traducir · ✂️ Dividir · 🔀 Dividir y traducir cada parte · 🗑️ Descartar»*.
+3. El bot muestra el progreso y te devuelve el resultado.
+
+No hace nada hasta que elijas una acción: si envías un archivo sin modo y sin
+tocar botones, solo verás la pregunta. También puedes elegir la acción desde el
+pie de foto del propio archivo (`/traducir`, `/dividir 25`, `/ambos`).
 
 ### Comandos
 
@@ -152,10 +165,13 @@ services:
 | `/start`, `/help` | Ayuda y estado actual |
 | `/lang` | Teclado para elegir el idioma de destino |
 | `/lang en` | Cambia el idioma directamente (cualquier código de Google: `pt`, `fr`, `ja`, `zh`, `ar`…) |
+| `/traducir` | El próximo archivo se traduce tal cual |
 | `/dividir` | El próximo archivo se parte en secciones sin traducir |
 | `/dividir 25` | …en secciones de 25 capítulos (en PDF, 25 páginas) |
 | `/dividir 8 partes` | …en 8 secciones iguales |
-| `/status` | Cola, tareas en curso y tamaño de la caché |
+| `/ambos` | El próximo archivo se divide y después se traduce cada sección |
+| `/ambos 25` | …con secciones de 25 capítulos |
+| `/status` | Cola, tareas en curso y tamaño de la caché (con botón 🔄) |
 | `/cancel` | Cancela la tarea en curso |
 
 También puedes escribirle un texto normal y te lo traduce al momento.
@@ -178,6 +194,20 @@ Después envía cada sección como un archivo normal: se traduce por separado, s
 guarda en la caché por separado y, si algo falla o el bot se reinicia, **solo
 reenvías esa sección** en lugar de la novela completa (perfecto para el plan
 gratuito con disco efímero).
+
+### 🔀 Dividir y traducir (`/ambos`)
+
+Si prefieres que el bot haga las dos cosas, toca **🔀 Dividir y traducir** (o
+envía el archivo con la leyenda «`/ambos`»):
+
+1. El bot te manda **todas las secciones sin traducir** (guárdalas de reserva).
+2. Después traduce **cada sección por separado** y te la envía terminada, con su
+   progreso («parte 3 de 8 · capítulo 12/50») en el mismo mensaje.
+
+Cada sección se guarda en la caché con su propia clave y la división es
+reproducible byte a byte: si una falla, reenvías el archivo original y solo se
+vuelve a traducir lo que faltaba (las partes ya hechas se recuperan al instante
+de la caché).
 
 ---
 
@@ -270,7 +300,7 @@ petición y sin límites agresivos.
 ## Estructura del proyecto
 
 ```
-bot.py              # capa de Telegram: comandos, cola de trabajo, envío
+bot.py              # capa de Telegram: menú de botones, comandos, cola y envío
 pipeline.py         # orquesta cada tarea, caché y reanudación
 translator.py       # traductores web gratuitos (Google + Microsoft) y relevo
 translator_api.py   # backend opcional con la API oficial de Google Cloud
@@ -322,8 +352,9 @@ de imágenes/colores/negritas en PDF, conservación de enlaces, cursivas,
 `&nbsp;`, índices y metadatos en EPUB, detección de escaneos y DRM,
 cancelación, agrupación en lotes, reintentos tras bloqueos, reanudación de
 EPUB/PDF/TXT a medias, la caché de resultados, el divisor de novelas
-(capítulos, secciones válidas y sin pérdidas), el servidor de salud y la cola
-de trabajo completa con un bot falso.
+(capítulos, secciones válidas, sin pérdidas y reproducibles byte a byte), el
+menú fijo y los teclados de acción, el servidor de salud y la cola de trabajo
+completa (traducir, dividir y dividir-y-traducir) con un bot falso.
 
 ## Limitaciones (importante)
 

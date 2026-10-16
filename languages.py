@@ -48,6 +48,37 @@ KEYBOARD_ROWS: list[list[str]] = [
 ]
 
 
+# Banderas para los botones del teclado de idioma.
+LANGUAGE_FLAGS: dict[str, str] = {
+    "es": "🇪🇸",
+    "en": "🇬🇧",
+    "pt": "🇵🇹",
+    "fr": "🇫🇷",
+    "de": "🇩🇪",
+    "it": "🇮🇹",
+    "ru": "🇷🇺",
+    "uk": "🇺🇦",
+    "pl": "🇵🇱",
+    "zh": "🇨🇳",
+    "ja": "🇯🇵",
+    "ko": "🇰🇷",
+    "ar": "🇸🇦",
+    "he": "🇮🇱",
+    "tr": "🇹🇷",
+    "nl": "🇳🇱",
+    "sv": "🇸🇪",
+    "el": "🇬🇷",
+}
+
+
+def flag(code: str | None) -> str:
+    """Bandera del idioma con espacio final (cadena vacía si no hay)."""
+    if not code:
+        return ""
+    emoji = LANGUAGE_FLAGS.get(code.strip().lower().split("-")[0], "")
+    return f"{emoji} " if emoji else ""
+
+
 def language_name(code: str | None) -> str:
     """Nombre legible de un código de idioma."""
     if not code:
