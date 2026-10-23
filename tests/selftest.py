@@ -45,6 +45,7 @@ from health import start_health_server
 from pdf_translate import translate_pdf
 from pipeline import DocumentTask, format_duration, safe_filename
 from splitter import SplitSpec, parse_split_command, split_document
+from supabase_store import SupabaseBackend
 from translator import (
     AutoTranslator,
     DeepLWebTranslator,
@@ -1362,6 +1363,173 @@ async def test_job_store() -> None:
     print("OK · almacén de progreso y caché:", report)
 
 
+class FakeRemote:
+    """Supabase Storage simulado, en memoria, para probar la reanudación."""
+
+    def __init__(self) -> None:
+        self.files: dict[str, bytes] = {}
+
+    def upload_path(self, remote_path: str, local_path: Path, **_kwargs) -> bool:
+        self.files[remote_path] = Path(local_path).read_bytes()
+        return True
+
+    def upload_bytes(self, remote_path: str, data: bytes, **_kwargs) -> bool:
+        self.files[remote_path] = data
+        return True
+
+    def download(self, remote_path: str) -> bytes | None:
+        return self.files.get(remote_path)
+
+    def list(self, prefix: str) -> list[dict]:
+        clean = prefix.strip("/")
+        names: list[str] = []
+        for remote_path in sorted(self.files):
+            if clean:
+                if not remote_path.startswith(clean + "/"):
+                    continue
+                name = remote_path[len(clean) + 1:]
+            else:
+                name = remote_path
+            if name and "/" not in name:
+                names.append(name)
+        return [{"name": name} for name in names]
+
+    def delete(self, remote_path: str) -> bool:
+        self.files.pop(remote_path, None)
+        return True
+
+    def delete_prefix(self, prefix: str) -> int:
+        clean = prefix.strip("/")
+        targets = [
+            path
+            for path in self.files
+            if path == clean or path.startswith(clean + "/")
+        ]
+        for path in targets:
+            self.files.pop(path, None)
+        return len(targets)
+
+    def prune_cache(self, **_kwargs) -> dict:
+        return {"removed": 0, "freed_bytes": 0}
+
+
+async def test_remote_job_store() -> None:
+    """Un disco nuevo recupera metadatos, checkpoints, texto y caché remotos."""
+    root = WORK / "store_remote"
+    remote = FakeRemote()
+    source = WORK / "sample.epub"
+    store = JobStore(root / "jobs1", root / "cache1", remote=remote)
+
+    key = store.key_for(file_digest(source), "es", 42)
+    store.save_meta(key, kind="epub", total=3, done=[0, 1], units=7, lang="es")
+    store.write_blob(key, 0, b"fragmento cero")
+    store.write_blob(key, 1, b"fragmento uno")
+
+    text_key = store.key_for(file_digest(source), "es", 43)
+    store.save_meta(text_key, kind="txt", total=2, lang="es")
+    store.append_text_records(
+        text_key,
+        [{"i": 0, "t": "Hola"}, {"i": 1, "t": "Mundo"}],
+    )
+
+    # Simula un redeploy: discos locales vacíos, mismo Storage.
+    restored = JobStore(root / "jobs2", root / "cache2", remote=remote)
+    restored.restore_job(key)
+    meta = restored.load_meta(key)
+    assert meta.get("done") == [0, 1], meta
+    assert restored.read_blob(key, 1) == b"fragmento uno"
+    restored.restore_job(text_key)
+    assert restored.read_text_progress(text_key) == {0: "Hola", 1: "Mundo"}
+
+    # La caché de salida también sobrevive, aunque ya no queden checkpoints.
+    output = WORK / "salida_remota.epub"
+    output.write_bytes(b"contenido final remoto")
+    cached = store.store_output(key, output, "salida.remota.epub")
+    store.finish_job(key, cached.name)
+    fresh = JobStore(root / "jobs3", root / "cache3", remote=remote)
+    recovered = fresh.cached_output(key)
+    assert recovered is not None, "no se recuperó el resultado remoto"
+    assert recovered.read_bytes() == b"contenido final remoto"
+    print("OK · reanudación remota (checkpoints, texto y caché)")
+
+
+def test_supabase_backend() -> None:
+    """El cliente REST habla con PostgREST y Storage usando la service_role."""
+    storage: dict[str, bytes] = {}
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("apikey") == "service-key", request.headers
+        assert request.headers.get("Authorization") == "Bearer service-key", request.headers
+        seen.append((request.method, request.url.path))
+        path = request.url.path
+
+        if path == "/storage/v1/bucket/traductor" and request.method == "GET":
+            return httpx.Response(404, json={"message": "not found"})
+        if path == "/storage/v1/bucket" and request.method == "POST":
+            return httpx.Response(200, json={"name": "traductor"})
+        if path == "/storage/v1/object/list/traductor":
+            body = json.loads(request.content or b"{}")
+            prefix = str(body.get("prefix") or "").strip("/")
+            names = []
+            for remote_path in sorted(storage):
+                if prefix and not remote_path.startswith(prefix + "/"):
+                    continue
+                name = remote_path[len(prefix) + 1:] if prefix else remote_path
+                if name and "/" not in name:
+                    names.append({"name": name})
+            return httpx.Response(200, json=names)
+        if path.startswith("/storage/v1/object/traductor/"):
+            remote_path = path.split("/storage/v1/object/traductor/", 1)[1]
+            if request.method == "POST":
+                storage[remote_path] = request.content
+                return httpx.Response(200, json={"Key": remote_path})
+            if request.method == "GET":
+                if remote_path not in storage:
+                    return httpx.Response(404)
+                return httpx.Response(200, content=storage[remote_path])
+            if request.method == "DELETE":
+                storage.pop(remote_path, None)
+                return httpx.Response(200)
+        if path == "/rest/v1/bot_jobs":
+            if request.method == "POST":
+                return httpx.Response(201)
+            if request.method == "PATCH":
+                return httpx.Response(204)
+            if request.method == "GET":
+                return httpx.Response(200, json=[{"id": "job1", "status": "running"}])
+        if path == "/rest/v1/bot_users":
+            if request.method == "POST":
+                return httpx.Response(201)
+            if request.method == "GET":
+                return httpx.Response(200, json=[{"user_id": 1, "lang": "es", "engine": "auto"}])
+        return httpx.Response(404, json={"message": f"unexpected {request.method} {path}"})
+
+    backend = SupabaseBackend(
+        "https://demo.supabase.co",
+        "service-key",
+        "traductor",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        assert backend.ensure_bucket(), "debería crear el bucket si no existe"
+        assert backend.upload_bytes("inputs/libro.txt", b"hola", content_type="text/plain")
+        assert backend.download("inputs/libro.txt") == b"hola"
+        assert [item["name"] for item in backend.list("inputs")] == ["libro.txt"]
+        assert backend.create_job({"id": "job1", "user_id": 1, "chat_id": 1, "file_name": "libro.txt"})
+        assert backend.update_job("job1", status="running")
+        assert backend.fetch_jobs()[0]["id"] == "job1"
+        assert backend.upsert_user(1, "es", "auto")
+        assert backend.fetch_users()[0]["user_id"] == 1
+        assert backend.delete_prefix("inputs") == 1
+        assert not storage, storage
+    finally:
+        backend.close()
+    assert ("POST", "/rest/v1/bot_jobs") in seen
+    assert ("PATCH", "/rest/v1/bot_jobs") in seen
+    print("OK · cliente REST de Supabase (PostgREST + Storage)")
+
+
 async def test_health_server() -> None:
     """El servidor de salud responde a Render (y solo con lo previsto)."""
     server = start_health_server(0, status_provider=lambda: {"queue": 3})
@@ -1519,6 +1687,38 @@ def test_ui_helpers() -> None:
     # La ETA solo aparece cuando ya hay datos suficientes para estimar
     assert bot_module._eta_text(0.02, 600) is None
     assert bot_module._eta_text(0.5, 600) is not None
+
+    # Límites de la cola: se suman archivos y bytes del mismo usuario
+    from types import SimpleNamespace
+
+    dummy_app = SimpleNamespace(
+        bot_data={
+            bot_module._TASKS_KEY: {
+                "a": SimpleNamespace(user_id=7, size=5),
+                "b": SimpleNamespace(user_id=7, size=10),
+                "c": SimpleNamespace(user_id=8, size=99),
+            }
+        }
+    )
+    assert bot_module._queue_usage(dummy_app, 7) == (2, 15)
+    row = bot_module._task_row(
+        DocumentTask(
+            task_id="abc123",
+            user_id=7,
+            chat_id=7,
+            status_message_id=3,
+            src_message_id=None,
+            src_path=WORK / "x.txt",
+            file_name="x.txt",
+            lang="es",
+            mode="both",
+            split_spec=SplitSpec("units", 25),
+            size=1234,
+            file_id="telegram-file",
+        )
+    )
+    assert row["id"] == "abc123" and row["split_value"] == 25, row
+    assert row["status"] == "queued" and row["size_bytes"] == 1234, row
     print("OK · menú fijo, teclados de acción y ETA")
 
 
@@ -1553,6 +1753,7 @@ async def test_worker_integration() -> None:
     app.bot_data[bot_module._QUEUE_KEY] = asyncio.Queue()
     app.bot_data[bot_module._ACTIVE_KEY] = {}
     app.bot_data[bot_module._PENDING_KEY] = {}
+    app.bot_data[bot_module._TASKS_KEY] = {}
 
     original_factory = pipeline.create_translator
     original_jobs, original_cache = config.JOBS_DIR, config.CACHE_DIR
@@ -1590,7 +1791,7 @@ async def test_worker_integration() -> None:
             )
 
         task = make_task(task_id, 99, 5, source)
-        app.bot_data[bot_module._PENDING_KEY][99] = task
+        app.bot_data[bot_module._PENDING_KEY][task.task_id] = task
         queue = app.bot_data[bot_module._QUEUE_KEY]
         queue.put_nowait(task)
         await asyncio.wait_for(queue.join(), timeout=60)
@@ -1613,7 +1814,7 @@ async def test_worker_integration() -> None:
         source2 = workdir2 / "texto.txt"
         source2.write_bytes(payload)
         again = make_task(second_id, 99, 6, source2)
-        app.bot_data[bot_module._PENDING_KEY][99] = again
+        app.bot_data[bot_module._PENDING_KEY][again.task_id] = again
         queue.put_nowait(again)
         await asyncio.wait_for(queue.join(), timeout=60)
         assert len(app.bot.documents) == 2, app.bot.documents
@@ -1646,7 +1847,7 @@ async def test_worker_integration() -> None:
             split_spec=SplitSpec("units", 5),
         )
         documents_before = len(app.bot.documents)
-        app.bot_data[bot_module._PENDING_KEY][97] = split_task
+        app.bot_data[bot_module._PENDING_KEY][split_task.task_id] = split_task
         queue.put_nowait(split_task)
         await asyncio.wait_for(queue.join(), timeout=60)
         new_documents = app.bot.documents[documents_before:]
@@ -1677,7 +1878,7 @@ async def test_worker_integration() -> None:
             split_spec=SplitSpec("units", 5),
         )
         documents_before = len(app.bot.documents)
-        app.bot_data[bot_module._PENDING_KEY][96] = both_task
+        app.bot_data[bot_module._PENDING_KEY][both_task.task_id] = both_task
         queue.put_nowait(both_task)
         await asyncio.wait_for(queue.join(), timeout=60)
         both_docs = app.bot.documents[documents_before:]
@@ -1691,6 +1892,43 @@ async def test_worker_integration() -> None:
             "falta el resumen final del modo «dividir y traducir»"
         )
         assert not workdir4.exists(), "no se limpió el directorio temporal del modo «ambos»"
+
+        # Varios volúmenes a la vez: se encolan juntos y se procesan en orden.
+        documents_before = len(app.bot.documents)
+        para_tasks: list[DocumentTask] = []
+        for index, text in enumerate(
+            ("First queued volume.\nSecond line.", "Another queued volume.\nLast line."),
+            start=1,
+        ):
+            para_id = f"cola{index}"
+            para_dir = config.WORK_DIR / para_id
+            para_dir.mkdir(parents=True, exist_ok=True)
+            para_src = para_dir / f"cola{index}.txt"
+            para_src.write_text(text, "utf-8")
+            para_task = DocumentTask(
+                task_id=para_id,
+                user_id=95,
+                chat_id=95,
+                status_message_id=20 + index,
+                src_message_id=None,
+                src_path=para_src,
+                file_name=f"cola{index}.txt",
+                lang="es",
+                size=para_src.stat().st_size,
+            )
+            para_tasks.append(para_task)
+            app.bot_data[bot_module._PENDING_KEY][para_task.task_id] = para_task
+            app.bot_data[bot_module._TASKS_KEY][para_task.task_id] = para_task
+            queue.put_nowait(para_task)
+        await asyncio.wait_for(queue.join(), timeout=60)
+        queued_docs = app.bot.documents[documents_before:]
+        assert [doc["filename"] for doc in queued_docs] == [
+            "cola1 [ES].txt",
+            "cola2 [ES].txt",
+        ], [doc["filename"] for doc in queued_docs]
+        assert all(doc["filename"].endswith("[ES].txt") for doc in queued_docs)
+        assert not [t for t in app.bot_data[bot_module._TASKS_KEY].values() if t.user_id == 95]
+        assert not app.bot_data[bot_module._PENDING_KEY], "quedaron tareas pendientes en la cola"
     finally:
         worker.cancel()
         pipeline.create_translator = original_factory
@@ -1700,6 +1938,8 @@ async def test_worker_integration() -> None:
         shutil.rmtree(config.WORK_DIR / "integracion01b", ignore_errors=True)
         shutil.rmtree(config.WORK_DIR / "integracion03", ignore_errors=True)
         shutil.rmtree(config.WORK_DIR / "integracion04", ignore_errors=True)
+        shutil.rmtree(config.WORK_DIR / "cola1", ignore_errors=True)
+        shutil.rmtree(config.WORK_DIR / "cola2", ignore_errors=True)
     print("OK · cola de trabajo, envío, caché, división y modo «ambos» (bot falso)")
 
 
@@ -1727,6 +1967,80 @@ async def test_real_google() -> None:
     print("PNG de verificación:", WORK / "real_pagina1.png")
 
 
+async def test_restore_pending_jobs() -> None:
+    """Las tareas guardadas en Supabase vuelven a la cola al arrancar."""
+    import bot as bot_module
+    import config
+
+    class RestoreBot:
+        def __init__(self) -> None:
+            self.sent: list[tuple[int, str]] = []
+            self.edits: list[tuple[int, int, str]] = []
+
+        async def send_message(self, chat_id, text, **_kwargs):
+            self.sent.append((chat_id, text))
+            return type("Message", (), {"message_id": 500 + len(self.sent)})()
+
+        async def edit_message_text(self, chat_id, message_id, text, **_kwargs):
+            self.edits.append((chat_id, message_id, text))
+
+    class RestoreBackend:
+        def __init__(self) -> None:
+            self.updates: list[tuple[str, dict]] = []
+
+        def fetch_jobs(self):
+            return [
+                {
+                    "id": "restore01",
+                    "chat_id": 77,
+                    "user_id": 77,
+                    "file_name": "novela.txt",
+                    "size_bytes": 4321,
+                    "lang": "es",
+                    "engine": "auto",
+                    "mode": "translate",
+                    "status": "running",
+                    "status_message_id": None,
+                    "file_id": "telegram-id",
+                    "input_key": "inputs/restore01/novela.txt",
+                }
+            ]
+
+        def update_job(self, task_id, **fields):
+            self.updates.append((task_id, fields))
+            return True
+
+    class RestoreApp:
+        def __init__(self) -> None:
+            self.bot = RestoreBot()
+            self.bot_data = {
+                bot_module._QUEUE_KEY: asyncio.Queue(),
+                bot_module._TASKS_KEY: {},
+                bot_module._PENDING_KEY: {},
+            }
+
+    app = RestoreApp()
+    backend = RestoreBackend()
+    original = bot_module.get_backend
+    bot_module.get_backend = lambda: backend
+    try:
+        await bot_module._restore_pending_jobs(app)
+        assert app.bot_data[bot_module._QUEUE_KEY].qsize() == 1
+        task = app.bot_data[bot_module._TASKS_KEY]["restore01"]
+        assert task.file_name == "novela.txt" and task.size == 4321
+        assert task.input_key == "inputs/restore01/novela.txt"
+        assert app.bot_data[bot_module._PENDING_KEY]["restore01"] is task
+        assert task.status_message_id, "debería crear un mensaje de estado nuevo"
+        assert app.bot.sent and "Recuperando" in app.bot.sent[0][1]
+        assert any(
+            fields.get("status") == "queued" for _task_id, fields in backend.updates
+        ), backend.updates
+    finally:
+        bot_module.get_backend = original
+        shutil.rmtree(config.WORK_DIR / "restore01", ignore_errors=True)
+    print("OK · tareas recuperadas desde Supabase al arrancar")
+
+
 async def main() -> None:
     real = "--real" in sys.argv
     shutil.rmtree(WORK, ignore_errors=True)
@@ -1741,6 +2055,8 @@ async def main() -> None:
         test_users_preferences()
         await test_health_server()
         await test_job_store()
+        await test_remote_job_store()
+        test_supabase_backend()
         await test_web_batches()
         await test_web_fallback_and_cooldown()
         await test_web_endpoint_failover()
@@ -1764,6 +2080,7 @@ async def main() -> None:
         await test_split_epub()
         await test_split_pdf()
         await test_worker_integration()
+        await test_restore_pending_jobs()
         if real:
             await test_real_google()
     finally:

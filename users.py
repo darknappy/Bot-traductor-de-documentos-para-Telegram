@@ -7,6 +7,7 @@ import os
 import threading
 
 import config
+from supabase_store import get_backend
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +16,7 @@ DEFAULT_ENGINE = "auto"
 
 _lock = threading.Lock()
 _cache: dict[str, dict[str, str]] | None = None
+_remote_disabled = False
 
 
 def _normalize(raw: dict) -> dict[str, dict[str, str]]:
@@ -65,6 +67,77 @@ def _entry(data: dict[str, dict[str, str]], user_id: int) -> dict[str, str]:
     return entry
 
 
+def _remote_upsert(user_id: int, entry: dict[str, str]) -> None:
+    """Guarda la preferencia en Supabase sin bloquear el bucle de Telegram."""
+    global _remote_disabled
+    if _remote_disabled:
+        return
+    backend = get_backend()
+    if backend is None:
+        return
+
+    def send() -> None:
+        global _remote_disabled
+        try:
+            ok = backend.upsert_user(
+                user_id,
+                entry.get("lang") or config.DEFAULT_TARGET_LANG,
+                entry.get("engine") or DEFAULT_ENGINE,
+            )
+        except Exception:  # noqa: BLE001 - Supabase nunca debe romper el bot
+            logger.debug("No se pudo guardar la preferencia en Supabase", exc_info=True)
+            return
+        if not ok:
+            _remote_disabled = True
+
+    # El cliente HTTP es síncrono y los handlers de Telegram son async: una
+    # petición lenta no debe congelar el botón de idioma o de motor.
+    threading.Thread(target=send, name="supabase-user", daemon=True).start()
+
+
+def preload() -> None:
+    """Carga las preferencias de Supabase al arrancar (si está configurado).
+
+    Si la tabla está vacía, sube las preferencias locales para no perderlas.
+    Si Supabase falla, se sigue usando ``users.json`` sin interrumpir el bot.
+    """
+    global _cache, _remote_disabled
+    backend = get_backend()
+    if backend is None:
+        return
+    rows = backend.fetch_users()
+    if not rows:
+        if backend.db_available:
+            with _lock:
+                data = _load()
+            for key, entry in data.items():
+                try:
+                    user_id = int(key)
+                except ValueError:
+                    continue
+                _remote_upsert(user_id, entry)
+        return
+
+    with _lock:
+        data = dict(_load())
+        for row in rows:
+            try:
+                user_id = int(row.get("user_id"))
+            except (TypeError, ValueError):
+                continue
+            entry = {"lang": str(row.get("lang") or config.DEFAULT_TARGET_LANG)}
+            engine = str(row.get("engine") or DEFAULT_ENGINE)
+            if engine != DEFAULT_ENGINE:
+                entry["engine"] = engine
+            data[str(user_id)] = entry
+        _cache = data
+    logger.info("Preferencias cargadas desde Supabase: %d usuario(s)", len(rows))
+
+
+def remote_enabled() -> bool:
+    return not _remote_disabled and get_backend() is not None
+
+
 def get_lang(user_id: int) -> str:
     """Idioma destino preferido del usuario (o el valor por defecto)."""
     with _lock:
@@ -73,12 +146,16 @@ def get_lang(user_id: int) -> str:
 
 def set_lang(user_id: int, lang: str) -> None:
     """Guarda el idioma destino preferido del usuario."""
+    changed = False
     with _lock:
         data = _load()
         entry = _entry(data, user_id)
         if entry.get("lang") != lang:
             entry["lang"] = lang
             _save(data)
+            changed = True
+    if changed:
+        _remote_upsert(user_id, entry)
 
 
 def get_engine(user_id: int) -> str:
@@ -89,6 +166,7 @@ def get_engine(user_id: int) -> str:
 
 def set_engine(user_id: int, engine: str) -> None:
     """Guarda el motor preferido (``auto`` se guarda como valor por defecto)."""
+    changed = False
     with _lock:
         data = _load()
         entry = _entry(data, user_id)
@@ -99,3 +177,6 @@ def set_engine(user_id: int, engine: str) -> None:
             else:
                 entry["engine"] = wanted
             _save(data)
+            changed = True
+    if changed:
+        _remote_upsert(user_id, entry)

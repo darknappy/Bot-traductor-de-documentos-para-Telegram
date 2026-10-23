@@ -26,6 +26,7 @@ from epub_translate import translate_epub
 from errors import JobCancelledError, UnsupportedFormatError
 from pdf_translate import translate_pdf
 from splitter import SplitPart, SplitSpec, split_document
+from supabase_store import get_backend
 from translator import BaseTranslator, create_translator
 
 logger = logging.getLogger(__name__)
@@ -52,8 +53,12 @@ class DocumentTask:
     engine: str = "auto"  # motor elegido por el usuario (auto/google/microsoft/deepl)
     mode: str = "translate"  # "translate" | "split" | "both"
     split_spec: SplitSpec | None = None
+    size: int = 0
+    file_id: str | None = None
+    input_key: str | None = None  # ruta del original en Supabase Storage
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     started_at: float = 0.0
+    last_db_update: float = 0.0
 
     def cancelled(self) -> bool:
         return self.cancel_event.is_set()
@@ -66,6 +71,7 @@ class JobResult:
     out_path: Path
     out_name: str
     caption: str
+    key: str | None = None
 
 
 @dataclass
@@ -80,10 +86,10 @@ class SplitOutcome:
 
 
 def get_store() -> JobStore:
-    """Almacén de progreso y caché (singleton)."""
+    """Almacén de progreso y caché (singleton, con Supabase si está activo)."""
     global _STORE
     if _STORE is None:
-        _STORE = JobStore(config.JOBS_DIR, config.CACHE_DIR)
+        _STORE = JobStore(config.JOBS_DIR, config.CACHE_DIR, remote=get_backend())
     return _STORE
 
 
@@ -167,19 +173,23 @@ async def _translate_text_file(
     total = max(1, len(targets))
 
     done_map: dict[int, str] = {}
-    progress_path: Path | None = None
     if store is not None and key:
-        meta = store.load_meta(key)
+        meta = await asyncio.to_thread(store.load_meta, key)
         valid = meta.get("kind") == "txt" and meta.get("total") == len(targets) and meta.get("lang") == translator.target_lang
         if valid:
-            progress_path = store.job_dir(key) / "lineas.jsonl"
-            done_map = _read_progress_lines(progress_path)
+            done_map = await asyncio.to_thread(store.read_text_progress, key)
             if done_map:
                 logger.info("Reanudando texto: %d/%d párrafos ya traducidos", len(done_map), len(targets))
         else:
-            store.clear_job(key)
-            store.save_meta(key, kind="txt", total=len(targets), lang=translator.target_lang, lines_done=0)
-            progress_path = store.job_dir(key) / "lineas.jsonl"
+            await asyncio.to_thread(store.clear_job, key)
+            await asyncio.to_thread(
+                store.save_meta,
+                key,
+                kind="txt",
+                total=len(targets),
+                lang=translator.target_lang,
+                lines_done=0,
+            )
 
     for index, translated in done_map.items():
         if 0 <= index < len(lines):
@@ -189,27 +199,23 @@ async def _translate_text_file(
     done = len(done_map)
     stats = {"lines": len(targets), "chars": 0, "resumed": len(done_map)}
 
-    handle = open(progress_path, "a", encoding="utf-8") if progress_path else None
     batch_size = 32
-    try:
-        for start in range(0, len(pending), batch_size):
-            if task.cancelled():
-                raise JobCancelledError()
-            indexes = pending[start:start + batch_size]
-            results = await translator.translate_many([lines[i] for i in indexes])
-            for index, result in zip(indexes, results):
-                lines[index] = result
-            if handle is not None:
-                for index, result in zip(indexes, results):
-                    handle.write(json.dumps({"i": index, "t": result}, ensure_ascii=False) + "\n")
-                handle.flush()
-                if store is not None and key:
-                    store.save_meta(key, lines_done=done + len(indexes))
-            done += len(indexes)
-            await progress(done / total, f"párrafo {done}/{len(targets)}")
-    finally:
-        if handle is not None:
-            handle.close()
+    for start in range(0, len(pending), batch_size):
+        if task.cancelled():
+            raise JobCancelledError()
+        indexes = pending[start:start + batch_size]
+        results = await translator.translate_many([lines[i] for i in indexes])
+        for index, result in zip(indexes, results):
+            lines[index] = result
+        if store is not None and key:
+            await asyncio.to_thread(
+                store.append_text_records,
+                key,
+                [{"i": index, "t": result} for index, result in zip(indexes, results)],
+            )
+            await asyncio.to_thread(store.save_meta, key, lines_done=done + len(indexes))
+        done += len(indexes)
+        await progress(done / total, f"párrafo {done}/{len(targets)}")
 
     out_path = task.src_path.with_name(output_name_for(task.file_name, task.lang))
     out_path.write_text("\n".join(lines), "utf-8")
@@ -306,10 +312,17 @@ async def process_job(task: DocumentTask, progress: ProgressCallback) -> JobResu
     # Mismo documento + idioma + usuario (+ motor): se reutiliza lo guardado.
     digest = await asyncio.to_thread(file_digest, task.src_path)
     key = store.key_for(digest, task.lang, task.user_id, task.engine)
-    cached = store.cached_output(key)
+    # Si el proceso se reinició, los checkpoints pueden estar en Supabase.
+    await asyncio.to_thread(store.restore_job, key)
+    cached = await asyncio.to_thread(store.cached_output, key)
     if cached is not None:
         logger.info("Resultado en caché para %s (%s)", task.file_name, key)
-        return JobResult(out_path=cached, out_name=upload_name, caption=_cached_caption(task, upload_name))
+        return JobResult(
+            out_path=cached,
+            out_name=upload_name,
+            caption=_cached_caption(task, upload_name),
+            key=key,
+        )
 
     upload_path = task.src_path.with_name(upload_name)
     started = time.monotonic()
@@ -338,8 +351,9 @@ async def process_job(task: DocumentTask, progress: ProgressCallback) -> JobResu
 
     # Guardar el resultado en la caché y liberar los archivos intermedios.
     try:
-        cached_path = store.store_output(key, upload_path, upload_name)
-        store.finish_job(
+        cached_path = await asyncio.to_thread(store.store_output, key, upload_path, upload_name)
+        await asyncio.to_thread(
+            store.finish_job,
             key,
             cached_path.name,
             kind=suffix.lstrip("."),
@@ -352,7 +366,7 @@ async def process_job(task: DocumentTask, progress: ProgressCallback) -> JobResu
         logger.warning("No se pudo guardar el resultado en la caché", exc_info=True)
         cached_path = upload_path
 
-    return JobResult(out_path=cached_path, out_name=upload_name, caption=caption)
+    return JobResult(out_path=cached_path, out_name=upload_name, caption=caption, key=key)
 
 
 # --------------------------------------------------------------------------- división en secciones

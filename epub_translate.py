@@ -12,6 +12,7 @@ nodo a nodo para no perder la estructura.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import shutil
@@ -406,7 +407,9 @@ async def translate_epub(
         content_index = {name: index for index, name in enumerate(content_names)}
         total = max(1, len(content_names))
 
-        done, units_total = _load_progress(store, key, len(content_names), translator.target_lang)
+        done, units_total = await asyncio.to_thread(
+            _load_progress, store, key, len(content_names), translator.target_lang
+        )
         stats["resumed"] = len(done)
         # Sin almacén en disco el resultado de cada documento vive en memoria.
         replaced: dict[str, bytes] = {}
@@ -440,13 +443,13 @@ async def translate_epub(
             new_content, units = await _render_translated(raw, translator, report_units)
             if units:
                 if store is not None and key:
-                    store.write_blob(key, index, new_content)
+                    await asyncio.to_thread(store.write_blob, key, index, new_content)
                 else:
                     replaced[name] = new_content
                 done.add(index)
                 units_total += units
                 if store is not None and key:
-                    store.save_meta(key, done=sorted(done), units=units_total)
+                    await asyncio.to_thread(store.save_meta, key, done=sorted(done), units=units_total)
             if progress:
                 await progress(
                     (index + 1) / total,

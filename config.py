@@ -59,6 +59,13 @@ WEB_MAX_INTERVAL: float = max(WEB_MIN_INTERVAL, _env_float("WEB_MAX_INTERVAL", 8
 # Documentos procesados a la vez (cada uno usa su propia concurrencia).
 MAX_CONCURRENT_JOBS: int = max(1, _env_int("MAX_CONCURRENT_JOBS", 1))
 
+# Cola personal: varios volúmenes se pueden enviar seguidos y se procesan de
+# uno en uno. Estos límites evitan llenar el disco/Supabase por error.
+QUEUE_MAX_FILES: int = max(1, _env_int("QUEUE_MAX_FILES", 10))
+QUEUE_MAX_MB: int = max(1, _env_int("QUEUE_MAX_MB", 100))
+# Preguntas «¿qué hago con este archivo?» pendientes a la vez.
+PENDING_MAX_FILES: int = max(1, _env_int("PENDING_MAX_FILES", 20))
+
 # Divisor de novelas (/dividir): capítulos por sección (TXT/MD/EPUB), páginas
 # por sección (PDF sin índice) y máximo de secciones que se envían de una vez.
 SPLIT_CHAPTERS_PER_PART: int = max(1, _env_int("SPLIT_CHAPTERS_PER_PART", 50))
@@ -88,6 +95,19 @@ CACHE_MAX_MB: int = max(1, _env_int("CACHE_MAX_MB", 512))
 
 # Archivo JSON con las preferencias de idioma de cada usuario.
 USERS_FILE: Path = Path(os.getenv("USERS_FILE", str(BASE_DIR / "users.json")))
+
+# --- Supabase (opcional) -----------------------------------------------------
+# Si defines SUPABASE_URL y SUPABASE_SERVICE_KEY, los trabajos, usuarios y
+# checkpoints se guardan en Supabase y sobreviven a reinicios/redeploys.
+# Usa la clave service_role (no la anon) y solo en variables de entorno.
+SUPABASE_URL: str = (os.getenv("SUPABASE_URL", "") or "").strip().rstrip("/")
+SUPABASE_SERVICE_KEY: str = (
+    os.getenv("SUPABASE_SERVICE_KEY", "") or os.getenv("SUPABASE_KEY", "") or ""
+).strip()
+SUPABASE_BUCKET: str = (os.getenv("SUPABASE_BUCKET", "traductor") or "traductor").strip()
+SUPABASE_JOBS_TABLE: str = (os.getenv("SUPABASE_JOBS_TABLE", "bot_jobs") or "bot_jobs").strip()
+SUPABASE_USERS_TABLE: str = (os.getenv("SUPABASE_USERS_TABLE", "bot_users") or "bot_users").strip()
+SUPABASE_TIMEOUT: float = max(3.0, _env_float("SUPABASE_TIMEOUT", 12.0))
 
 # Servidor HTTP de salud (Render lo necesita en los Web Services). Render define
 # la variable PORT; también se puede forzar con HEALTH_PORT.

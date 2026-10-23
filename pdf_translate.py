@@ -403,7 +403,8 @@ async def translate_pdf(
             except Exception as err:  # noqa: BLE001 - sin punto de control se puede seguir
                 logger.warning("No se pudo guardar el PDF parcial: %s", err)
                 return
-            store.save_meta(
+            await asyncio.to_thread(
+                store.save_meta,
                 key,
                 kind="pdf",
                 lang=translator.target_lang,

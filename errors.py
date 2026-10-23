@@ -16,3 +16,7 @@ class ScannedPdfError(RuntimeError):
 
 class SplitError(RuntimeError):
     """El documento no se puede dividir en secciones (sin capítulos detectables)."""
+
+
+class InputUnavailableError(RuntimeError):
+    """No se pudo recuperar el archivo original (ni de Supabase ni de Telegram)."""

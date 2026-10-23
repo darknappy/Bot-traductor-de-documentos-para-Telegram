@@ -27,6 +27,11 @@ Microsoft o solo DeepL) con el botón **🧠 Motor** o el comando `/motor`.
   Dividir · 🔀 Dividir y traducir · ⚙️ Idioma · 🧠 Motor · 📊 Estado · 🚫
   Cancelar · ❓ Ayuda). Si envías un archivo sin haber elegido nada, el bot te
   pregunta qué hacer con botones en vez de ponerse a traducir solo.
+- **Cola de varios volúmenes** → envía varios archivos seguidos; se procesan en
+  orden, de uno en uno. Límite por defecto: 10 archivos / 100 MB.
+- **☁️ Supabase opcional** → guarda el original, la cola, los checkpoints y los
+  resultados. Si Render se reinicia, el bot reanuda solo y no hay que reenviar
+  nada. Sin Supabase sigue funcionando con el disco local.
 
 Pensado también para **novelas web de gran volumen (+1000 capítulos)**: traduce
 por lotes (el motor de Google nuevo admite **listas enteras de párrafos en una
@@ -130,9 +135,9 @@ cada 5 minutos. Con eso el servicio permanece despierto (el plan gratuito
 incluye 750 horas al mes y un servicio despierto consume ~730).
 
 > El plan gratuito tiene 512 MB de RAM y **disco efímero**: al reiniciar o
-> redeplegar se pierden la caché y el progreso. El bot lo detecta y empieza
-> limpio; si reenvías el mismo archivo continúa donde iba (si el progreso
-> sobrevivió) o lo vuelve a traducir.
+> redeplegar se pierden la cola, la caché y el progreso. Para que los trabajos
+> largos sobrevivan, configura **Supabase** (sección siguiente). Sin Supabase,
+> el bot empieza limpio y hay que reenviar el archivo.
 
 ### 4. Opción recomendada para novelas enormes: Background Worker
 
@@ -155,20 +160,109 @@ services:
 
 ---
 
+## Supabase: que los trabajos sobrevivan a reinicios (recomendado)
+
+Render (plan gratuito) usa **disco efímero**: al reiniciar o redeployar se
+pierden la cola, el original y el progreso. El bot puede guardarlos en
+**Supabase** (Postgres + Storage) y recuperarlos solo al arrancar. Así puedes
+enviar varios volúmenes, cerrar Telegram y no volver a enviar nada aunque el
+servidor se reinicie.
+
+Supabase no sustituye a Render: Render sigue ejecutando Python y traduciendo;
+Supabase solo guarda el estado y los archivos. El plan gratuito de Supabase
+incluye **1 GB de Storage**, más que suficiente para la cola máxima de 100 MB.
+
+### Configurarlo (5 minutos)
+
+1. Crea un proyecto gratis en [supabase.com](https://supabase.com).
+2. Entra en **SQL Editor → New query**, pega el contenido de
+   **`supabase_schema.sql`** y pulsa **Run**. Crea las tablas `bot_jobs` (cola
+   y estado) y `bot_users` (idioma y motor).
+3. Ve a **Project Settings → API** y copia:
+   - **Project URL** (algo como `https://xxxx.supabase.co`).
+   - **service_role** (en «Project API keys»; **no** uses la `anon`).
+4. En Render → tu servicio → **Environment**, añade:
+   ```
+   SUPABASE_URL=https://xxxx.supabase.co
+   SUPABASE_SERVICE_KEY=eyJhbGciOi...   # service_role
+   SUPABASE_BUCKET=traductor
+   ```
+5. Guarda y deja que Render redepliegue. El bot crea el bucket privado
+   `traductor` si no existe (también puedes crearlo a mano en **Storage**).
+
+> ⚠️ **Seguridad:** la clave `service_role` se salta RLS. Úsala solo en las
+> variables de entorno de Render, nunca en el repositorio, en el móvil ni en
+> una web pública. Las tablas tienen RLS activado y no tienen políticas: sin la
+> service_role no se puede leer nada.
+
+### Qué se guarda y cuándo
+
+- **Original** → se sube a Storage al empezar cada tarea. Si el bot se reinicia
+  a mitad, lo descarga de ahí en vez de pedírtelo otra vez.
+- **Cola y estado** → `bot_jobs`: archivo, usuario, idioma, motor, modo,
+  progreso, mensaje de estado y resultado.
+- **Checkpoints** → PDF parcial, fragmentos EPUB y chunks de texto. Se suben
+  después de cada avance; al reanudar se descargan y la traducción sigue donde
+  iba.
+- **Resultado** → se guarda en `cache/` para reenviarlo al instante. Se limpia
+  con la misma antigüedad/tamaño que la caché local (`CACHE_TTL_DAYS` y
+  `CACHE_MAX_MB`). El original se borra de Supabase cuando la tarea se envía.
+- **Preferencias** → `bot_users` (idioma y motor), con copia local en
+  `users.json`.
+
+Al arrancar, el bot busca tareas `queued`, `running`, `ready`… y las vuelve a
+poner en la cola **en el mismo orden**. Si el mensaje de estado original se
+borró, crea uno nuevo.
+
+### Si Supabase falla o no está configurado
+
+El bot **no se rompe**: si faltan `SUPABASE_URL`/`SUPABASE_SERVICE_KEY`, si la
+tabla no existe o si Supabase está pausado, sigue trabajando con el disco local
+como siempre. La diferencia es que un reinicio de Render ya no se recupera
+solo. Los avisos aparecen en los logs de Render.
+
+> Los proyectos gratuitos de Supabase se pausan tras una semana sin actividad.
+> Si eso pasa, el bot cae al modo local; entra en el panel de Supabase para
+> reactivarlo.
+
+---
+
 ## Uso
 
 1. Abre tu bot en Telegram y pulsa **Iniciar**: verás el **menú de botones**
    fijo bajo el campo de texto.
-2. Toca **🌐 Traducir** (u otra opción) y envíale el archivo; o envía el
-   archivo directamente y el bot te preguntará qué hacer con él:
+2. Toca **🌐 Traducir** (u otra opción) y envíale **uno o varios archivos**
+   seguidos; o envía los archivos directamente y el bot te preguntará qué hacer
+   con cada uno:
    *«🌐 Traducir · ✂️ Dividir · 🔀 Dividir y traducir cada parte · 🗑️ Descartar»*.
    Si eliges 🔀, primero te pide **cuántos capítulos por sección** (25/50/75/100)
    con botones.
-3. El bot muestra el progreso y te devuelve el resultado.
+3. El bot los procesa **de uno en uno, en orden**, muestra el progreso de cada
+   uno y te devuelve los resultados. Puedes seguir enviando archivos mientras
+   trabaja: se añaden a la cola.
 
-No hace nada hasta que elijas una acción: si envías un archivo sin modo y sin
-tocar botones, solo verás la pregunta. También puedes elegir la acción desde el
-pie de foto del propio archivo (`/traducir`, `/dividir 25`, `/ambos`).
+El modo que elijas (Traducir, Dividir o Dividir y traducir) **sigue activo para
+todos los archivos que envíes** hasta que pulses **🚫 Desactivar modo**. Si no
+hay modo activo, el bot solo te pregunta y no hace nada hasta que elijas.
+También puedes elegir la acción desde el pie de foto del propio archivo
+(`/traducir`, `/dividir 25`, `/ambos`).
+
+### Cola de varios volúmenes
+
+Puedes enviar los volúmenes de una novela uno detrás de otro sin esperar a que
+termine el anterior. El bot mantiene una cola **por orden de llegada** y
+procesa un documento a la vez (`MAX_CONCURRENT_JOBS=1`), que es lo más seguro
+para los traductores gratuitos.
+
+- Límites por defecto: **10 archivos** y **100 MB** en total
+  (`QUEUE_MAX_FILES`, `QUEUE_MAX_MB`). Cada archivo sigue limitado a 20 MB por
+  Telegram.
+- `/status` muestra la cola y la tarea en curso.
+- `/cancel` cancela **la tarea activa y todas las que tengas en cola**.
+- Si envías varios archivos sin modo, cada uno recibe su propia pregunta y
+  puedes responderlas en cualquier orden.
+- Con Supabase configurado, la cola y el progreso se recuperan solos tras un
+  reinicio o redeploy.
 
 ### Comandos
 
@@ -179,14 +273,14 @@ pie de foto del propio archivo (`/traducir`, `/dividir 25`, `/ambos`).
 | `/lang en` | Cambia el idioma directamente (cualquier código de Google: `pt`, `fr`, `ja`, `zh`, `ar`…) |
 | `/motor` | Teclado para elegir el motor de traducción (automático, Google, Microsoft o DeepL) |
 | `/motor google` | Fija el motor: `auto`, `google`, `microsoft` o `deepl` |
-| `/traducir` | El próximo archivo se traduce tal cual |
-| `/dividir` | El próximo archivo se parte en secciones sin traducir |
+| `/traducir` | Los archivos que envíes se traducen tal cual (modo persistente) |
+| `/dividir` | Los archivos que envíes se parten en secciones sin traducir |
 | `/dividir 25` | …en secciones de 25 capítulos (en PDF, 25 páginas) |
 | `/dividir 8 partes` | …en 8 secciones iguales |
-| `/ambos` | El próximo archivo se divide y se traduce cada sección (te pide el tamaño con botones) |
+| `/ambos` | Los archivos que envíes se dividen y se traduce cada sección (te pide el tamaño con botones) |
 | `/ambos 25` | …con secciones de 25 capítulos, sin preguntar |
-| `/status` | Cola, tareas en curso, motor en uso y tamaño de la caché (con botón 🔄) |
-| `/cancel` | Cancela la tarea en curso |
+| `/status` | Cola, tareas en curso, motor en uso, Supabase y tamaño de la caché (con botón 🔄) |
+| `/cancel` | Cancela la tarea activa y las que estén en cola |
 
 También puedes escribirle un texto normal y te lo traduce al momento.
 
@@ -209,9 +303,9 @@ indica la parte. El rango de capítulos queda en el pie de foto del mensaje,
 porque la numeración detectada no siempre coincide con la real del libro.
 
 Después envía cada sección como un archivo normal: se traduce por separado, se
-guarda en la caché por separado y, si algo falla o el bot se reinicia, **solo
-reenvías esa sección** en lugar de la novela completa (perfecto para el plan
-gratuito con disco efímero).
+guarda en la caché por separado y, si algo falla o el bot se reinicia, **con
+Supabase se reanuda automáticamente** y sin Supabase solo reenvías esa sección
+en lugar de la novela completa.
 
 ### 🔀 Dividir y traducir (`/ambos`)
 
@@ -264,11 +358,12 @@ las siguientes.
   secciones (por ejemplo de 50 capítulos) y envía las partes por separado; así
   ninguna se acerca al límite y, si algo falla, solo reenvías una parte.
 - **Reanudación**: el progreso se guarda por capítulos (EPUB), por páginas
-  (PDF) y por párrafos (TXT). Si el proceso se reinicia o lo cancelas, al
-  reenviar el mismo archivo continúa por donde iba en lugar de empezar de cero.
+  (PDF) y por párrafos (TXT). Con Supabase, al reiniciar el bot recupera el
+  original y los checkpoints y continúa **sin que reenvíes nada**. Sin Supabase,
+  al reenviar el mismo archivo continúa por donde iba.
 - **Caché**: cuando un documento termina, el resultado se guarda (7 días o
-  512 MB por defecto). Si vuelves a enviar el mismo archivo, te lo devuelve
-  **al instante** sin traducir nada.
+  512 MB por defecto; también en Supabase si está activo). Si vuelves a enviar
+  el mismo archivo, te lo devuelve **al instante** sin traducir nada.
 - **Velocidad**: con los endpoints web gratuitos una novela de 1500 capítulos
   (unas 4.000–8.000 peticiones agrupadas) tarda aproximadamente **entre 20
   minutos y 2 horas**, según el tamaño y las pausas por límite de los
@@ -355,8 +450,12 @@ petición y sin límites agresivos.
   independientes: en el EPUB se recorta el índice NCX/navegación, se ajustan
   las referencias y los capítulos que no van en la sección se eliminan del
   paquete (los estilos, imágenes y demás recursos se copian intactos).
-- **Cola de trabajo**: las tareas se procesan en cola (1 a la vez por defecto)
-  para no saturar el traductor; varios usuarios pueden enviar documentos.
+- **Cola de trabajo**: puedes enviar varios archivos seguidos; se procesan en
+  orden, uno a la vez por defecto (`MAX_CONCURRENT_JOBS=1`) para no saturar el
+  traductor. Si Supabase está configurado, la cola sobrevive a los reinicios.
+- **Persistencia opcional en Supabase**: original, cola, checkpoints y caché en
+  Postgres/Storage. Si no hay credenciales o Supabase falla, todo sigue
+  funcionando en local.
 
 ## Estructura del proyecto
 
@@ -368,10 +467,12 @@ translator_api.py   # backend opcional con la API oficial de Google Cloud
 pdf_translate.py    # traducción de PDF conservando el diseño
 epub_translate.py   # traducción de EPUB conservando estructura y estilos
 splitter.py         # detector de capítulos y divisor de novelas en secciones
-checkpoints.py      # progreso persistente por documento y caché de resultados
+checkpoints.py      # progreso persistente, caché y espejo en Supabase
+supabase_store.py   # cliente REST de Supabase (Postgres + Storage)
+supabase_schema.sql # tablas que hay que crear en el SQL Editor de Supabase
 health.py           # servidor HTTP de salud para Render (/health, /status)
 languages.py        # catálogo de idiomas
-users.py            # preferencias por usuario (idioma y motor) en users.json
+users.py            # preferencias por usuario (local + Supabase)
 config.py           # variables de entorno y límites
 errors.py           # excepciones compartidas
 render.yaml         # despliegue en Render (Web Service gratuito o worker)
@@ -391,8 +492,17 @@ data/               # (se crea sola) trabajo, progreso y caché
 | `WEB_MIN_INTERVAL` | `0.6` | Segundos mínimos entre peticiones web (desde Render usa `1`-`1.5`) |
 | `WEB_MAX_INTERVAL` | `8` | Ritmo más lento al que se frena si un proveedor limita (`429`) |
 | `MAX_CONCURRENT_JOBS` | `1` | Documentos traducidos a la vez |
+| `QUEUE_MAX_FILES` | `10` | Archivos que puedes tener en cola a la vez |
+| `QUEUE_MAX_MB` | `100` | Tamaño total máximo de la cola |
+| `PENDING_MAX_FILES` | `20` | Preguntas «¿qué hago con este archivo?» pendientes |
 | `MAX_INPUT_MB` | `20` | Tamaño máximo de entrada |
 | `MAX_OUTPUT_MB` | `48` | Tamaño máximo de salida |
+| `SUPABASE_URL` | — | URL del proyecto Supabase (opcional; activa la persistencia) |
+| `SUPABASE_SERVICE_KEY` | — | Clave `service_role` de Supabase (solo servidor) |
+| `SUPABASE_BUCKET` | `traductor` | Bucket privado de Storage (se crea solo) |
+| `SUPABASE_TIMEOUT` | `12` | Espera máxima de las peticiones a Supabase (segundos) |
+| `SUPABASE_JOBS_TABLE` | `bot_jobs` | Tabla de cola/estado |
+| `SUPABASE_USERS_TABLE` | `bot_users` | Tabla de preferencias |
 | `SPLIT_CHAPTERS_PER_PART` | `50` | Capítulos por sección en `/dividir` (TXT/MD/EPUB) |
 | `SPLIT_PAGES_PER_PART` | `100` | Páginas por sección en PDF sin índice |
 | `SPLIT_MAX_PARTS` | `100` | Máximo de secciones que genera `/dividir` |
@@ -418,8 +528,10 @@ anti-eco), la **selección de motor** (`auto`/`google`/`microsoft`/`deepl`), las
 preferencias por usuario, reanudación de EPUB/PDF/TXT a medias, la caché de
 resultados, el divisor de novelas (capítulos, secciones válidas, sin pérdidas y
 reproducibles byte a byte), el menú fijo y los teclados de acción (incluido el
-selector de motor), el servidor de salud y la cola de trabajo completa
-(traducir, dividir y dividir-y-traducir) con un bot falso.
+selector de motor), el servidor de salud, la cola de varios archivos (orden,
+límites y cancelación), la persistencia remota simulada (checkpoints, caché y
+tareas) y la cola de trabajo completa (traducir, dividir y
+dividir-y-traducir) con un bot falso.
 
 ## Limitaciones (importante)
 
@@ -437,7 +549,9 @@ selector de motor), el servidor de salud y la cola de trabajo completa
   (o a DeepL) para no dejar el libro a medias. Si aun así falla te avisa para
   que lo intentes más tarde — o cambia de motor con 🧠 **Motor**.
 - **Disco efímero en hosting gratuito**: al reiniciar el servicio se pierden la
-  caché y el progreso (no el libro original, que sigue en Telegram).
+  cola, la caché y el progreso locales. Configura **Supabase** para que el
+  original, la cola y los checkpoints sobrevivan; sin él tendrás que reenviar
+  los archivos pendientes.
 
 ## Aviso de uso
 

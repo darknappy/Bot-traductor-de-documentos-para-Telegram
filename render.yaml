@@ -46,8 +46,20 @@ services:
         value: "10"
       - key: MAX_CONCURRENT_JOBS
         value: "1"
+      - key: QUEUE_MAX_FILES
+        value: "10"
+      - key: QUEUE_MAX_MB
+        value: "100"
       - key: TRANSLATOR_BACKEND
         value: auto
+      # Supabase: rellena estos valores en Render → Environment. Son secretos
+      # (sobre todo la service_role); no se guardan en el repositorio.
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: SUPABASE_BUCKET
+        value: traductor
       - key: CACHE_TTL_DAYS
         value: "7"
       - key: CACHE_MAX_MB
