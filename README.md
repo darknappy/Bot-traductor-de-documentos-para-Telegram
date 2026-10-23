@@ -258,6 +258,7 @@ para los traductores gratuitos.
   (`QUEUE_MAX_FILES`, `QUEUE_MAX_MB`). Cada archivo sigue limitado a 20 MB por
   Telegram.
 - `/status` muestra la cola y la tarea en curso.
+- Si un paso tarda (por ejemplo, Google está limitando o se está subiendo un checkpoint), el mensaje muestra «sigo trabajando» cada ~45 s. No hace falta pulsar `/status` para desbloquearlo: el proceso sigue solo.
 - `/cancel` cancela **la tarea activa y todas las que tengas en cola**.
 - Si envías varios archivos sin modo, cada uno recibe su propia pregunta y
   puedes responderlas en cualquier orden.

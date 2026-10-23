@@ -165,6 +165,11 @@ def _status_snapshot() -> dict:
                     "lang": task.lang,
                     "mode": task.mode,
                     "elapsed": round(time.monotonic() - task.started_at, 1) if task.started_at else 0,
+                    "progress": round(min(1.0, max(0.0, task.last_fraction)) * 100),
+                    "note": (task.last_note or "")[:80],
+                    "idle": round(time.monotonic() - task.last_progress_at, 1)
+                    if task.last_progress_at
+                    else None,
                 }
             )
         active_ids = {task.task_id for task in active_tasks}
@@ -475,9 +480,16 @@ def status_text(preference: str | None = None) -> str:
     ]
     for task in active:
         emoji = _MODE_EMOJI.get(str(task.get("mode", "translate")), "🔄")
+        detail = ""
+        note = str(task.get("note") or "").strip()
+        if note:
+            detail = f" · {int(task.get('progress', 0))}% · {html.escape(note)}"
+        idle = task.get("idle")
+        if isinstance(idle, (int, float)) and idle >= _HEARTBEAT_SECONDS:
+            detail += f" · última señal hace {format_duration(idle)}"
         lines.append(
             f"{emoji} <code>{html.escape(str(task.get('file', '?')))}</code> · "
-            f"{format_duration(task.get('elapsed', 0))}"
+            f"{format_duration(task.get('elapsed', 0))}{detail}"
         )
     for task in queued[:5]:
         emoji = _MODE_EMOJI.get(str(task.get("mode", "translate")), "🔄")
@@ -1519,6 +1531,7 @@ async def _run_split_and_translate(bot, task: DocumentTask, reporter: ProgressRe
     outcome = await process_split_job(task, report)
     total = len(outcome.parts)
 
+    task.phase = "sending"
     await reporter.update(f"📤 Enviando {total} parte(s) sin traducir…", force=True)
     for part in outcome.parts:
         await _send_file(bot, task, part.path, part.name, _part_caption(part, "todo"))
@@ -1527,6 +1540,7 @@ async def _run_split_and_translate(bot, task: DocumentTask, reporter: ProgressRe
     for index, part in enumerate(outcome.parts, 1):
         if task.cancelled():
             raise JobCancelledError()
+        task.phase = "processing"
         await report((index - 1) / total, f"parte {index} de {total} · empezando")
 
         sub = DocumentTask(
@@ -1548,6 +1562,7 @@ async def _run_split_and_translate(bot, task: DocumentTask, reporter: ProgressRe
             await report(overall, f"parte {_index} de {_total} · {note}")
 
         result = await process_job(sub, part_report)
+        task.phase = "sending"
         await _send_file(bot, task, result.out_path, result.out_name, _part_caption(part, "done"))
         await asyncio.sleep(0.4)
 
@@ -1645,6 +1660,49 @@ async def _cleanup_task_checkpoints(task: DocumentTask) -> None:
         logger.debug("No se pudieron borrar los checkpoints de %s", task.task_id, exc_info=True)
 
 
+_HEARTBEAT_SECONDS = 45.0
+_HEARTBEAT_POLL = 15.0
+
+
+async def _heartbeat_loop(task: DocumentTask, reporter: ProgressReporter) -> None:
+    """Mantiene visible que la tarea sigue viva aunque un paso tarde.
+
+    Algunas peticiones a Google o las subidas de checkpoints pueden tardar
+    minutos sin llamar a ``progress``. Sin este latido el mensaje parecía
+    congelado aunque el proceso siguiera trabajando.
+    """
+    while True:
+        # Se comprueba más a menudo de lo que se edita para que el primer
+        # latido llegue como máximo ~60 s después del último avance.
+        await asyncio.sleep(_HEARTBEAT_POLL)
+        if task.cancelled():
+            return
+        if task.phase != "processing":
+            continue
+        now = time.monotonic()
+        last = task.last_progress_at or task.started_at or now
+        idle = now - last
+        if idle < _HEARTBEAT_SECONDS:
+            continue
+        note = (task.last_note or "trabajando").strip() or "trabajando"
+        elapsed = now - (task.started_at or now)
+        await reporter.update(
+            _progress_text(task, task.last_fraction, f"{note} · sigo trabajando", elapsed),
+            force=True,
+        )
+        # El latido también cuenta como señal de vida: así no se repite cada
+        # 15 s, sino una vez cada ~45 s mientras no haya avances reales.
+        task.last_progress_at = now
+        task.last_db_update = now
+        await _db_call(
+            "update_job",
+            task.task_id,
+            progress=round(min(1.0, max(0.0, task.last_fraction)), 4),
+            progress_note=f"{note} · sin avances hace {format_duration(idle)}"[:300],
+        )
+        logger.info("Latido de %s: %s (%.0f s sin avances)", task.task_id, note, idle)
+
+
 async def _worker(app: Application) -> None:
     queue: asyncio.Queue = app.bot_data[_QUEUE_KEY]
     active: dict = app.bot_data[_ACTIVE_KEY]
@@ -1655,6 +1713,7 @@ async def _worker(app: Application) -> None:
     while True:
         task = await queue.get()
         result = None
+        heartbeat: asyncio.Task | None = None
         try:
             pending.pop(task.task_id, None)
             if task.cancelled():
@@ -1666,6 +1725,11 @@ async def _worker(app: Application) -> None:
             await _ensure_status_message(bot, task, "🔄 <b>Preparando tarea…</b>")
             task.started_at = time.monotonic()
             reporter = ProgressReporter(bot, task.chat_id, task.status_message_id)
+            task.phase = "processing"
+            task.last_progress_at = task.started_at
+            task.last_fraction = 0.0
+            task.last_note = "descargando el archivo"
+            heartbeat = asyncio.create_task(_heartbeat_loop(task, reporter))
 
             await _db_call(
                 "update_job",
@@ -1702,15 +1766,20 @@ async def _worker(app: Application) -> None:
                 progress=0.0,
                 progress_note="analizando el documento",
             )
+            task.last_progress_at = time.monotonic()
+            task.last_note = "analizando el documento"
             await reporter.update(
                 _progress_text(task, 0.0, "analizando el documento…", 0.0), force=True
             )
 
             async def report(fraction: float, note: str) -> None:
-                await reporter.update(
-                    _progress_text(task, fraction, note, time.monotonic() - task.started_at)
-                )
                 now = time.monotonic()
+                task.last_progress_at = now
+                task.last_fraction = fraction
+                task.last_note = note
+                await reporter.update(
+                    _progress_text(task, fraction, note, now - task.started_at)
+                )
                 if now - task.last_db_update >= 10.0:
                     task.last_db_update = now
                     await _db_call(
@@ -1723,6 +1792,7 @@ async def _worker(app: Application) -> None:
 
             if task.mode == "split":
                 outcome = await process_split_job(task, report)
+                task.phase = "sending"
                 await reporter.update(f"📤 Enviando {len(outcome.parts)} parte(s)…", force=True)
                 for part in outcome.parts:
                     await _send_file(bot, task, part.path, part.name, _part_caption(part))
@@ -1737,6 +1807,7 @@ async def _worker(app: Application) -> None:
             else:
                 result = await process_job(task, report)
 
+                task.phase = "sending"
                 out_mb = result.out_path.stat().st_size / 1048576
                 if out_mb > config.MAX_OUTPUT_MB:
                     await _safe_edit(
@@ -1837,6 +1908,14 @@ async def _worker(app: Application) -> None:
             await _db_call("update_job", task.task_id, status="failed", error="error inesperado")
             await _safe_edit(bot, task, "⚠️ Ocurrió un error inesperado al procesar el documento.")
         finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                try:
+                    await heartbeat
+                except asyncio.CancelledError:
+                    pass
+                except Exception:  # noqa: BLE001 - un latido nunca debe tumbar al worker
+                    logger.warning("Falló el latido de %s", task.task_id, exc_info=True)
             active.pop(task.task_id, None)
             pending.pop(task.task_id, None)
             tasks.pop(task.task_id, None)

@@ -59,6 +59,10 @@ class DocumentTask:
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     started_at: float = 0.0
     last_db_update: float = 0.0
+    last_progress_at: float = 0.0
+    last_fraction: float = 0.0
+    last_note: str = ""
+    phase: str = "processing"
 
     def cancelled(self) -> bool:
         return self.cancel_event.is_set()

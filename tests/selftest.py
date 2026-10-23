@@ -2041,6 +2041,56 @@ async def test_restore_pending_jobs() -> None:
     print("OK · tareas recuperadas desde Supabase al arrancar")
 
 
+async def test_heartbeat() -> None:
+    """El latido mantiene vivo el mensaje cuando un paso tarda minutos."""
+    import bot as bot_module
+
+    class Reporter:
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+
+        async def update(self, text: str, *, force: bool = False) -> None:
+            self.texts.append(text)
+
+    async def fake_db_call(*_args, **_kwargs):
+        return None
+
+    task = DocumentTask(
+        task_id="heartbeat01",
+        user_id=1,
+        chat_id=1,
+        status_message_id=1,
+        src_message_id=None,
+        src_path=WORK / "heartbeat.txt",
+        file_name="novela.txt",
+        lang="es",
+    )
+    task.started_at = time.monotonic() - 100
+    task.last_progress_at = time.monotonic() - 100
+    task.last_fraction = 0.42
+    task.last_note = "página 4/10"
+    reporter = Reporter()
+    old_seconds, old_poll = bot_module._HEARTBEAT_SECONDS, bot_module._HEARTBEAT_POLL
+    old_db_call = bot_module._db_call
+    bot_module._HEARTBEAT_SECONDS = 0.02
+    bot_module._HEARTBEAT_POLL = 0.005
+    bot_module._db_call = fake_db_call
+    heartbeat = asyncio.create_task(bot_module._heartbeat_loop(task, reporter))
+    try:
+        await asyncio.sleep(0.08)
+    finally:
+        heartbeat.cancel()
+        try:
+            await heartbeat
+        except asyncio.CancelledError:
+            pass
+        bot_module._HEARTBEAT_SECONDS, bot_module._HEARTBEAT_POLL = old_seconds, old_poll
+        bot_module._db_call = old_db_call
+    assert reporter.texts, "el latido no actualizó el mensaje"
+    assert "42%" in reporter.texts[0] and "sigo trabajando" in reporter.texts[0], reporter.texts
+    print("OK · latido de progreso mientras el traductor tarda")
+
+
 async def main() -> None:
     real = "--real" in sys.argv
     shutil.rmtree(WORK, ignore_errors=True)
@@ -2081,6 +2131,7 @@ async def main() -> None:
         await test_split_pdf()
         await test_worker_integration()
         await test_restore_pending_jobs()
+        await test_heartbeat()
         if real:
             await test_real_google()
     finally:
