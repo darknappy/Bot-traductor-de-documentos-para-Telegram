@@ -1586,8 +1586,9 @@ def test_build_app() -> None:
         app = bot_module.build_app()
     finally:
         config.TELEGRAM_BOT_TOKEN = original
-    from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler
+    from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, TypeHandler
 
+    assert any(isinstance(handler, TypeHandler) for handler in app.handlers.get(-1, []))
     handlers = app.handlers[0]
     commands = {
         command
@@ -2041,6 +2042,69 @@ async def test_restore_pending_jobs() -> None:
     print("OK · tareas recuperadas desde Supabase al arrancar")
 
 
+async def test_authorization() -> None:
+    """La lista blanca bloquea mensajes y botones de usuarios no autorizados."""
+    import config
+    import bot as bot_module
+    from telegram.ext import ApplicationHandlerStop
+    from types import SimpleNamespace
+
+    class Message:
+        def __init__(self) -> None:
+            self.replies: list[str] = []
+
+        async def reply_text(self, text: str, **_kwargs) -> None:
+            self.replies.append(text)
+
+    class Query:
+        def __init__(self) -> None:
+            self.answers: list[str] = []
+
+        async def answer(self, text: str, **_kwargs) -> None:
+            self.answers.append(text)
+
+    old_ids = config.AUTHORIZED_USER_IDS
+    old_notice = dict(bot_module._DENIED_NOTICE)
+    bot_module._DENIED_NOTICE.clear()
+    try:
+        config.AUTHORIZED_USER_IDS = frozenset({111})
+        assert bot_module.is_authorized(SimpleNamespace(id=111))
+        assert not bot_module.is_authorized(SimpleNamespace(id=999))
+        assert not bot_module.is_authorized(None)
+
+        message, query = Message(), Query()
+        denied = SimpleNamespace(
+            effective_user=SimpleNamespace(id=999, full_name="Intruso", username="intruso"),
+            callback_query=query,
+            effective_message=message,
+            effective_chat=SimpleNamespace(type="private"),
+        )
+        try:
+            await bot_module._authorization_gate(denied, None)
+        except ApplicationHandlerStop:
+            pass
+        else:
+            raise AssertionError("el usuario no autorizado no fue bloqueado")
+        assert query.answers and "No estás autorizado" in query.answers[0]
+        assert message.replies and "999" in message.replies[0]
+
+        allowed = SimpleNamespace(
+            effective_user=SimpleNamespace(id=111, full_name="Dueño", username="dueno"),
+            callback_query=Query(),
+            effective_message=Message(),
+            effective_chat=SimpleNamespace(type="private"),
+        )
+        await bot_module._authorization_gate(allowed, None)  # no debe lanzar
+
+        config.AUTHORIZED_USER_IDS = frozenset()
+        assert bot_module.is_authorized(None)
+    finally:
+        config.AUTHORIZED_USER_IDS = old_ids
+        bot_module._DENIED_NOTICE.clear()
+        bot_module._DENIED_NOTICE.update(old_notice)
+    print("OK · lista blanca de usuarios autorizados")
+
+
 async def test_heartbeat() -> None:
     """El latido mantiene vivo el mensaje cuando un paso tarda minutos."""
     import bot as bot_module
@@ -2131,6 +2195,7 @@ async def main() -> None:
         await test_split_pdf()
         await test_worker_integration()
         await test_restore_pending_jobs()
+        await test_authorization()
         await test_heartbeat()
         if real:
             await test_real_google()

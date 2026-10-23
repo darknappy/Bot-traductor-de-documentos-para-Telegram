@@ -78,6 +78,32 @@ la caché de resultados.
 
 ---
 
+## Acceso privado (solo tú y quien autorices)
+
+El bot usa una **lista blanca de IDs numéricos de Telegram**:
+
+1. Habla con [@userinfobot](https://t.me/userinfobot) y copia tu ID (por
+   ejemplo `123456789`).
+2. Define la variable `AUTHORIZED_USER_IDS` con tu ID y los de las personas
+   autorizadas, separados por comas:
+   ```env
+   AUTHORIZED_USER_IDS=123456789,987654321
+   ```
+3. Reinicia el bot o vuelve a desplegarlo en Render.
+
+Con la variable definida, cualquier otro usuario recibe un aviso de bot privado
+y **no puede ejecutar comandos, botones ni enviar documentos**. El aviso incluye
+su propio ID por si quieres autorizarlo después. Los intentos denegados quedan
+en los logs.
+
+Si `AUTHORIZED_USER_IDS` está vacía, el bot queda abierto a cualquiera (es el
+comportamiento anterior y sirve para probar en local). En producción no la
+dejes vacía. La lista blanca filtra **usuarios**, no chats: si añades el bot a
+un grupo, un usuario autorizado podrá usarlo allí y los archivos se enviarán a
+ese grupo. Para uso personal, úsalo en un chat privado.
+
+---
+
 ## Desplegarlo en Render (GitHub → Render)
 
 El bot funciona como **Web Service** (el plan gratuito vale) o como
@@ -486,6 +512,7 @@ data/               # (se crea sola) trabajo, progreso y caché
 | Variable | Por defecto | Descripción |
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | — | Token de @BotFather (obligatorio) |
+| `AUTHORIZED_USER_IDS` | vacío | IDs numéricos autorizados, separados por comas. Vacío = abierto a cualquiera |
 | `DEFAULT_TARGET_LANG` | `es` | Idioma destino por defecto |
 | `TRANSLATOR_BACKEND` | `auto` | Motor por defecto del servidor: `auto` (Google + relevo Microsoft/DeepL), `google`/`web`, `microsoft`/`ms`, `deepl` o `api` (Google Cloud oficial). Cada usuario puede cambiarlo con 🧠 Motor |
 | `GOOGLE_API_KEY` | — | Clave de la API oficial (solo con `api`) |

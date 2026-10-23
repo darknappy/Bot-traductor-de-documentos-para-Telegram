@@ -34,8 +34,27 @@ def _env_optional_int(name: str) -> int | None:
         return None
 
 
+def _env_id_set(name: str) -> frozenset[int]:
+    """Lee una lista de IDs separados por comas, punto y coma o espacios."""
+    raw = os.getenv(name, "")
+    ids: set[int] = set()
+    for chunk in raw.replace(";", ",").replace(" ", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            ids.add(int(chunk))
+        except ValueError:
+            continue
+    return frozenset(ids)
+
+
 # Token del bot creado con @BotFather (obligatorio).
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
+# Lista blanca de usuarios de Telegram (IDs numéricos). Si está vacía, el bot
+# queda abierto a cualquiera; en producción conviene rellenarla siempre.
+AUTHORIZED_USER_IDS: frozenset[int] = _env_id_set("AUTHORIZED_USER_IDS")
 
 # Idioma destino por defecto (código de Google: "es", "en", "pt"...).
 DEFAULT_TARGET_LANG: str = (os.getenv("DEFAULT_TARGET_LANG", "es") or "es").strip().lower()

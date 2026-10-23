@@ -35,6 +35,10 @@ services:
       # Obligatorio: se pega en Render → Environment (nunca en el repositorio).
       - key: TELEGRAM_BOT_TOKEN
         sync: false
+      # Tu ID de Telegram y el de las personas autorizadas, separados por comas.
+      # Si se deja vacío, el bot queda abierto a cualquiera.
+      - key: AUTHORIZED_USER_IDS
+        sync: false
       - key: DEFAULT_TARGET_LANG
         value: es
       - key: TRANSLATE_CONCURRENCY

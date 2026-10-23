@@ -27,15 +27,17 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
-from telegram.constants import ChatAction, ParseMode
+from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import BadRequest, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 from telegram.request import HTTPXRequest
@@ -702,6 +704,85 @@ async def _safe_edit(bot, task: DocumentTask, text: str) -> bool:
         return True
     except TelegramError:
         return False
+
+
+# Avisos de acceso denegado: como máximo uno por usuario y hora para no
+# convertir el bot en un amplificador de spam si alguien lo encuentra.
+_DENIED_NOTICE: dict[int, float] = {}
+_DENIED_NOTICE_SECONDS = 3600.0
+
+
+def is_authorized(user) -> bool:
+    """True si el usuario puede usar el bot.
+
+    Sin ``AUTHORIZED_USER_IDS`` el bot mantiene el comportamiento abierto de
+    siempre (útil en local); con la variable definida solo pasan esos IDs.
+    """
+    if not config.AUTHORIZED_USER_IDS:
+        return True
+    return user is not None and user.id in config.AUTHORIZED_USER_IDS
+
+
+def _should_notify_denied(user_id: int) -> bool:
+    now = time.monotonic()
+    last = _DENIED_NOTICE.get(user_id)
+    if last is not None and now - last < _DENIED_NOTICE_SECONDS:
+        return False
+    if len(_DENIED_NOTICE) > 500:
+        oldest = min(_DENIED_NOTICE, key=_DENIED_NOTICE.get)
+        _DENIED_NOTICE.pop(oldest, None)
+    _DENIED_NOTICE[user_id] = now
+    return True
+
+
+async def _authorization_gate(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bloquea cualquier update de un usuario que no esté en la lista blanca.
+
+    Se registra en el grupo -1: se ejecuta antes que los handlers normales y
+    ``ApplicationHandlerStop`` impide que el update siga su curso.
+    """
+    user = update.effective_user
+    if is_authorized(user):
+        return
+
+    if user is None:
+        logger.warning("Acceso denegado: update sin usuario (%s)", type(update).__name__)
+    else:
+        logger.warning(
+            "Acceso denegado a %s (@%s), id=%s",
+            user.full_name or "sin nombre",
+            user.username or "sin usuario",
+            user.id,
+        )
+
+    query = update.callback_query
+    if query is not None:
+        try:
+            await query.answer("No estás autorizado para usar este bot.", show_alert=True)
+        except TelegramError:
+            pass
+
+    message = update.effective_message
+    chat = update.effective_chat
+    if (
+        user is not None
+        and message is not None
+        and chat is not None
+        and chat.type == ChatType.PRIVATE
+        and _should_notify_denied(user.id)
+    ):
+        try:
+            await message.reply_text(
+                "🔒 <b>Bot privado</b>\n"
+                f"Tu ID de Telegram es <code>{user.id}</code>.\n"
+                "Pide al administrador que lo añada a "
+                "<code>AUTHORIZED_USER_IDS</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass
+
+    raise ApplicationHandlerStop
 
 
 async def _edit_status(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int | None, text: str) -> None:
@@ -2123,6 +2204,8 @@ def build_app() -> Application:
     )
 
     no_document = ~filters.Document.ALL  # deja pasar los comandos escritos en el pie de foto
+    # Grupo -1: la lista blanca se comprueba antes que cualquier otro handler.
+    app.add_handler(TypeHandler(Update, _authorization_gate), group=-1)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("lang", cmd_lang))
@@ -2163,6 +2246,16 @@ def main() -> None:
         # Render (y otras plataformas) necesitan un puerto HTTP abierto.
         start_health_server(config.HEALTH_PORT, status_provider=_status_snapshot)
     app = build_app()
+    if config.AUTHORIZED_USER_IDS:
+        logger.info(
+            "Acceso restringido a %d usuario(s) de la lista blanca.",
+            len(config.AUTHORIZED_USER_IDS),
+        )
+    else:
+        logger.warning(
+            "AUTHORIZED_USER_IDS está vacío: cualquier usuario puede usar el bot. "
+            "Define tu ID numérico para cerrarlo."
+        )
     logger.info("Iniciando el bot…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
